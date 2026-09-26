@@ -1,0 +1,16 @@
+{
+  "DefaultCookiesSetting": 1,
+  "RestoreOnStartup": 1,
+  "PasswordManagerEnabled": true,
+  "AutofillAddressEnabled": true,
+  "AutofillCreditCardEnabled": true,
+  "BrowserSignin": 1,
+  "SyncDisabled": true,
+  "DefaultNotificationsSetting": 2,
+  "DownloadRestrictions": 0,
+  "AllowFileSelectionDialogs": true,
+  "PromptForDownloadLocation": false,
+  "BookmarkBarEnabled": true,
+  "DeveloperToolsAvailability": 1,
+  "URLBlocklist": ["chrome://policy"]
+}

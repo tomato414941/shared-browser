@@ -1,0 +1,36 @@
+# One shared browser. Values come from an instance file (instances/<name>.env) via --env-file.
+services:
+  browser:
+    image: shared-browser:latest
+    build: .
+    container_name: shared-browser-${SB_NAME}
+    restart: unless-stopped
+    shm_size: 2gb
+    cap_add:
+      - SYS_ADMIN
+    ports:
+      - "127.0.0.1:${SB_WEB_PORT}:8080"      # viewer (put a reverse proxy in front to reach it remotely)
+      - "127.0.0.1:${SB_CDP_PORT}:9223"      # CDP, unauthenticated: loopback only
+      - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/udp"   # Docker publishes past ufw; bind to the address clients use
+      - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/tcp"
+    volumes:
+      - "${SB_PROFILE_DIR}:/home/neko/profile"
+    environment:
+      SB_HOME_URL: ${SB_HOME_URL}
+      SB_LANG: ${SB_LANG}
+      SB_CHROME_FLAGS: ${SB_CHROME_FLAGS}
+      NEKO_DESKTOP_SCREEN: ${SB_SCREEN}
+      NEKO_CAPTURE_VIDEO_CODEC: ${SB_VIDEO_CODEC}
+      NEKO_CAPTURE_VIDEO_PIPELINES: ${SB_VIDEO_PIPELINES}
+      NEKO_WEBRTC_UDPMUX: ${SB_WEBRTC_PORT}
+      NEKO_WEBRTC_TCPMUX: ${SB_WEBRTC_PORT}
+      NEKO_WEBRTC_NAT1TO1: ${SB_PUBLIC_IP}
+      NEKO_WEBRTC_ICELITE: "1"
+      NEKO_SERVER_PROXY: "true"
+      NEKO_SERVER_BIND: 127.0.0.1:8081    # nginx fronts it on 8080 and adds /go/<token>
+      NEKO_SESSION_COOKIE_ENABLED: "true"
+      NEKO_SESSION_COOKIE_SECURE: ${SB_COOKIE_SECURE}
+      NEKO_SESSION_COOKIE_EXPIRATION: ${SB_SESSION_HOURS}h
+      NEKO_SESSION_FILE: /home/neko/profile/neko-sessions.json   # sessions outlive a restart, next to the profile
+      NEKO_MEMBER_MULTIUSER_USER_PASSWORD: ${SB_USER_PASSWORD}
+      NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: ${SB_ADMIN_PASSWORD}

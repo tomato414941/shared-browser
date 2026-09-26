@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""Run shared browsers: one instance file, one container, one CDP address."""
+import json
+import os
+import secrets
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+INSTANCES = ROOT / "instances"
+DEFAULTS = {
+    "SB_HOME_URL": "about:blank",
+    "SB_LANG": "en",
+    "SB_CHROME_FLAGS": "",
+    "SB_SCREEN": "1440x960@30",
+    "SB_COOKIE_SECURE": "true",
+    "SB_SESSION_HOURS": "720",
+    "SB_WEBRTC_BIND": "0.0.0.0",
+    "SB_VIDEO_CODEC": "vp8",
+    "SB_VIDEO_PIPELINES": "{}",
+}
+
+
+def usage():
+    print(
+        "Usage: shared-browser <command> [name]\n"
+        "  new <name> [KEY=VALUE ...]   Write instances/<name>.env with free ports and fresh passwords.\n"
+        "  build                        Build the image (downloads Google Chrome).\n"
+        "  up <name>                    Start the instance; restarts on its own after a reboot.\n"
+        "  down <name>                  Stop it. The profile stays.\n"
+        "  restart <name>\n"
+        "  status <name>\n"
+        "  endpoint <name> [--env]      Print where the browser is: CDP for agents, the viewer for people.\n"
+        "  link <name> [--minutes N] [--as who]\n"
+        "                               Print a one-time link that logs a person in; valid 10 minutes by default.\n"
+        "  ls                           List instances.\n"
+        "Instance keys: SB_WEB_PORT SB_CDP_PORT SB_WEBRTC_PORT SB_WEBRTC_BIND SB_PROFILE_DIR SB_PUBLIC_IP SB_HOME_URL SB_LANG\n"
+        "  SB_CHROME_FLAGS SB_SCREEN SB_VIDEO_CODEC SB_VIDEO_PIPELINES SB_COOKIE_SECURE SB_SESSION_HOURS SB_VIEWER_URL SB_USER_PASSWORD SB_ADMIN_PASSWORD",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def env_path(name):
+    if not name or "/" in name or name.startswith("."):
+        usage()
+    return INSTANCES / f"{name}.env"
+
+
+def read_env(name):
+    path = env_path(name)
+    if not path.exists():
+        sys.exit(f"No instance '{name}'. Create it with: shared-browser new {name}")
+    values = dict(DEFAULTS)
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def write_env(name, values):
+    INSTANCES.mkdir(mode=0o700, exist_ok=True)
+    path = env_path(name)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        for key, value in values.items():
+            f.write(f"{key}={value}\n")
+    return path
+
+
+def port_free(port):
+    # Bind on every address, TCP and UDP: a port taken on one interface (say, a tailnet address) is not free.
+    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        with socket.socket(socket.AF_INET, kind) as s:
+            try:
+                s.bind(("0.0.0.0", port))
+            except OSError:
+                return False
+    return True
+
+
+def used_ports():
+    ports = set()
+    if INSTANCES.exists():
+        for path in INSTANCES.glob("*.env"):
+            for line in path.read_text().splitlines():
+                if line.startswith("SB_") and "_PORT=" in line:
+                    ports.add(int(line.split("=", 1)[1]))
+    return ports
+
+
+def next_port(start, taken):
+    port = start
+    while port in taken or not port_free(port):
+        port += 1
+    taken.add(port)
+    return port
+
+
+def public_ip():
+    try:
+        return subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3).stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        try:
+            s.connect(("192.0.2.1", 1))
+            return s.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
+
+
+def compose(name, *args, **kwargs):
+    # Defaults added after an instance was created still apply: compose reads a merged copy, not the instance file.
+    values = read_env(name)
+    Path(values["SB_PROFILE_DIR"]).mkdir(parents=True, exist_ok=True, mode=0o700)
+    merged = env_path(name).with_suffix(".merged.env")
+    fd = os.open(merged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        for key, value in values.items():
+            f.write(f"{key}={value}\n")
+    try:
+        return subprocess.run(
+            ["docker", "compose", "-p", f"shared-browser-{name}", "--env-file", str(merged), *args],
+            cwd=ROOT, **kwargs,
+        )
+    finally:
+        merged.unlink(missing_ok=True)
+
+
+def cmd_new(name, overrides):
+    if env_path(name).exists():
+        sys.exit(f"Instance '{name}' already exists: {env_path(name)}")
+    taken = used_ports()
+    values = {
+        "SB_NAME": name,
+        "SB_WEB_PORT": next_port(8090, taken),
+        "SB_CDP_PORT": next_port(9242, taken),
+        "SB_WEBRTC_PORT": next_port(59000, taken),
+        "SB_PROFILE_DIR": Path.home() / ".local/share/shared-browser" / name,
+        "SB_PUBLIC_IP": public_ip(),
+        **DEFAULTS,
+        "SB_USER_PASSWORD": secrets.token_urlsafe(9),
+        "SB_ADMIN_PASSWORD": secrets.token_urlsafe(9),
+    }
+    for item in overrides:
+        key, _, value = item.partition("=")
+        if not key.startswith("SB_") or not value:
+            sys.exit(f"Bad override: {item}")
+        values[key] = value
+    path = write_env(name, values)
+    print(path)
+
+
+def cmd_link(name, rest):
+    import fcntl, time
+    values = read_env(name)
+    minutes, who = 10, "viewer"
+    args = list(rest)
+    while args:
+        flag = args.pop(0)
+        if flag == "--minutes" and args:
+            minutes = int(args.pop(0))
+        elif flag == "--as" and args:
+            who = args.pop(0)
+        else:
+            usage()
+    links = Path(values["SB_PROFILE_DIR"]) / "links.json"
+    links.touch(mode=0o600, exist_ok=True)
+    token = secrets.token_urlsafe(24)
+    with open(links, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            items = json.load(f)
+        except ValueError:
+            items = []
+        now = time.time()
+        items = [l for l in items if l["expires"] > now]
+        items.append({"token": token, "expires": now + minutes * 60, "as": who})
+        f.seek(0), f.truncate(), json.dump(items, f)
+    base = values.get("SB_VIEWER_URL") or f"http://127.0.0.1:{values['SB_WEB_PORT']}"
+    print(f"{base}/go/{token}")
+
+
+def cmd_endpoint(name, as_env):
+    values = read_env(name)
+    out = {
+        "name": name,
+        "cdp_url": f"http://127.0.0.1:{values['SB_CDP_PORT']}",
+        "viewer_url": values.get("SB_VIEWER_URL") or f"http://127.0.0.1:{values['SB_WEB_PORT']}",
+        "viewer_password": values["SB_USER_PASSWORD"],
+        "admin_password": values["SB_ADMIN_PASSWORD"],
+        "webrtc_port": int(values["SB_WEBRTC_PORT"]),
+    }
+    if as_env:
+        for key, value in out.items():
+            print(f"SHARED_BROWSER_{key.upper()}={value}")
+    else:
+        print(json.dumps(out, indent=2))
+
+
+def main(argv):
+    if not argv:
+        usage()
+    command, rest = argv[0], argv[1:]
+    if command == "ls":
+        for path in sorted(INSTANCES.glob("*.env")) if INSTANCES.exists() else []:
+            print(path.stem)
+    elif command == "build":
+        subprocess.run(["docker", "build", "-t", "shared-browser:latest", "."], cwd=ROOT, check=True)
+    elif command == "new" and rest:
+        cmd_new(rest[0], rest[1:])
+    elif command in ("up", "down", "restart", "status") and len(rest) == 1:
+        args = {"up": ["up", "-d"], "down": ["down"], "restart": ["restart"], "status": ["ps"]}[command]
+        sys.exit(compose(rest[0], *args).returncode)
+    elif command == "endpoint" and rest:
+        cmd_endpoint(rest[0], "--env" in rest[1:])
+    elif command == "link" and rest:
+        cmd_link(rest[0], rest[1:])
+    else:
+        usage()
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
