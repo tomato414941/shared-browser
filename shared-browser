@@ -19,6 +19,7 @@ DEFAULTS = {
     "SB_SESSION_HOURS": "720",
     "SB_WEBRTC_BIND": "0.0.0.0",
     "SB_VIDEO_CODEC": "vp8",
+    "SB_VIDEO_IDS": "main",
     "SB_VIDEO_PIPELINES": "{}",
 }
 
@@ -37,7 +38,7 @@ def usage():
         "                               Print a one-time link that logs a person in; valid 10 minutes by default.\n"
         "  ls                           List instances.\n"
         "Instance keys: SB_WEB_PORT SB_CDP_PORT SB_WEBRTC_PORT SB_WEBRTC_BIND SB_PROFILE_DIR SB_PUBLIC_IP SB_HOME_URL SB_LANG\n"
-        "  SB_CHROME_FLAGS SB_SCREEN SB_VIDEO_CODEC SB_VIDEO_PIPELINES SB_COOKIE_SECURE SB_SESSION_HOURS SB_VIEWER_URL SB_USER_PASSWORD SB_ADMIN_PASSWORD",
+        "  SB_CHROME_FLAGS SB_SCREEN SB_VIDEO_CODEC SB_VIDEO_IDS SB_VIDEO_PIPELINES SB_COOKIE_SECURE SB_SESSION_HOURS SB_VIEWER_URL SB_USER_PASSWORD SB_ADMIN_PASSWORD",
         file=sys.stderr,
     )
     sys.exit(2)

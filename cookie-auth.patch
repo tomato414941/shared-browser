@@ -1,0 +1,154 @@
+--- a/server/internal/config/session.go
++++ b/server/internal/config/session.go
+@@ -116,7 +116,7 @@
+ 		return err
+ 	}
+ 
+-	cmd.PersistentFlags().String("session.cookie.path", "", "path of the cookie")
++	cmd.PersistentFlags().String("session.cookie.path", "/", "path of the cookie")
+ 	if err := viper.BindPFlag("session.cookie.path", cmd.PersistentFlags().Lookup("session.cookie.path")); err != nil {
+ 		return err
+ 	}
+--- a/server/internal/http/legacy/session.go
++++ b/server/internal/http/legacy/session.go
+@@ -40,6 +40,7 @@
+ 
+ 	id, ip  string
+ 	token   string
++	cookie  string
+ 	name    string
+ 	isAdmin bool
+ 	client  *http.Client
+@@ -85,6 +86,8 @@
+ 
+ 	if s.token != "" {
+ 		req.Header.Set("Authorization", "Bearer "+s.token)
++	} else if s.cookie != "" {
++		req.Header.Set("Cookie", s.cookie)
+ 	}
+ 
+ 	res, err := s.client.Do(req)
+@@ -174,6 +177,16 @@
+ 
+ func (s *session) create(username, password string) error {
+ 	data := api.SessionDataPayload{}
++	if cookie := s.r.Header.Get("Cookie"); cookie != "" {
++		s.cookie = cookie
++		if err := s.apiReq(http.MethodGet, "/api/whoami", nil, &data); err != nil {
++			return err
++		}
++		s.id, s.ip = data.ID, getIp(s.r)
++		s.h.sessionIPs[s.id] = s.ip
++		s.name, s.isAdmin = data.Profile.Name, data.Profile.IsAdmin
++		return nil
++	}
+ 
+ 	err := s.apiReq(http.MethodPost, "/api/login", api.SessionLoginPayload{
+ 		Username: username,
+@@ -199,13 +212,16 @@
+ 
+ func (s *session) destroy() {
+ 	defer s.client.CloseIdleConnections()
++	defer delete(s.h.sessionIPs, s.id)
++
++	// The browser owns cookie sessions; closing a WebSocket must allow reconnecting.
++	if s.cookie != "" {
++		return
++	}
+ 
+ 	// logout session
+ 	err := s.apiReq(http.MethodPost, "/api/logout", nil, nil)
+ 	if err != nil {
+ 		s.logger.Error().Err(err).Msg("failed to logout")
+ 	}
+-
+-	// remove session id from ip map
+-	delete(s.h.sessionIPs, s.id)
+-}
++}
+--- a/server/internal/http/legacy/handler.go
++++ b/server/internal/http/legacy/handler.go
+@@ -33,9 +33,6 @@
+ 	DefaultUpgrader = &websocket.Upgrader{
+ 		ReadBufferSize:  1024,
+ 		WriteBufferSize: 1024,
+-		CheckOrigin: func(r *http.Request) bool {
+-			return true
+-		},
+ 	}
+ )
+ 
+@@ -105,7 +102,11 @@
+ 		defer s.destroy()
+ 
+ 		// dial to the remote backend
+-		connBackend, _, err := h.wsDialer.Dial("ws://"+h.serverAddr+path.Join(s.pathPrefix, "/api/ws")+"?token="+url.QueryEscape(s.token), nil)
++		backendHeaders := make(http.Header)
++		if s.cookie != "" {
++			backendHeaders.Set("Cookie", s.cookie)
++		}
++		connBackend, _, err := h.wsDialer.Dial("ws://"+h.serverAddr+path.Join(s.pathPrefix, "/api/ws")+"?token="+url.QueryEscape(s.token), backendHeaders)
+ 		if err != nil {
+ 			h.logger.Error().Err(err).Msg("couldn't dial to the remote backend")
+ 
+--- a/client/src/components/connect.vue
++++ b/client/src/components/connect.vue
+@@ -156,7 +156,18 @@
+     private displayname: string = ''
+     private password: string = ''
+ 
+-    mounted() {
++    async mounted() {
++      try {
++        const response = await fetch('./api/whoami', { credentials: 'same-origin' })
++        if (response.ok) {
++          const session = await response.json()
++          this.$accessor.login({ displayname: session.profile.name, password: '' })
++          return
++        }
++      } catch (_) {
++        // Show the login form when a session is unavailable.
++      }
++
+       // auto-password fill
+       let password = this.$accessor.password
+       if (this.autoPassword !== null) {
+--- a/client/src/store/index.ts
++++ b/client/src/store/index.ts
+@@ -92,12 +92,32 @@
+       }
+     },
+ 
+-    login(store, { displayname, password }: { displayname: string; password: string }) {
+-      accessor.setLogin({ displayname, password })
+-      $client.login(password, displayname)
++    async login(store, { displayname, password }: { displayname: string; password: string }) {
++      if (password) {
++        try {
++          const response = await fetch('./api/login', {
++            method: 'POST',
++            credentials: 'same-origin',
++            headers: { 'Content-Type': 'application/json' },
++            body: JSON.stringify({ username: displayname, password }),
++          })
++          if (!response.ok) throw new Error('Login failed')
++        } catch (_) {
++          accessor.setConnected(false)
++          Vue.prototype.$swal({ title: 'Login failed', icon: 'error' })
++          return
++        }
++      }
++      accessor.setLogin({ displayname, password: '' })
++      $client.login('', displayname)
+     },
+ 
+-    logout() {
++    async logout() {
++      try {
++        await fetch('./api/logout', { method: 'POST', credentials: 'same-origin' })
++      } catch (_) {
++        // Disconnect locally when the server is unavailable.
++      }
+       accessor.setLogin({ displayname: '', password: '' })
+       set('displayname', '')
+       set('password', '')
