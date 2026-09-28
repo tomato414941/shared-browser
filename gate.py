@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,21 +34,43 @@ def take(token):
 
 
 class Gate(BaseHTTPRequestHandler):
+    def has_session(self):
+        cookie = self.headers.get("Cookie")
+        if not cookie:
+            return False
+        req = urllib.request.Request(NEKO + "/api/whoami", headers={"Cookie": cookie})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as res:
+                return res.status == 200
+        except (urllib.error.URLError, TimeoutError):
+            return False
+
+    def redirect(self, cookies=()):
+        self.send_response(302)
+        for cookie in cookies:
+            self.send_header("set-cookie", cookie)
+        self.send_header("location", "/")
+        self.send_header("cache-control", "no-store")
+        self.end_headers()
+
     def do_GET(self):
+        if self.has_session():
+            self.redirect()
+            return
         token = self.path.split("?", 1)[0].removeprefix("/go/").strip("/")
         link = take(token) if token and "/" not in token else None
         if not link:
-            self.send_response(404), self.send_header("content-type", "text/plain; charset=utf-8"), self.end_headers()
+            self.send_response(404)
+            self.send_header("content-type", "text/plain; charset=utf-8")
+            self.send_header("cache-control", "no-store")
+            self.end_headers()
             self.wfile.write("This link is no longer valid.\n".encode())
             return
         body = json.dumps({"username": link.get("as") or "viewer", "password": PASSWORD}).encode()
         req = urllib.request.Request(NEKO + "/api/login", data=body, headers={"content-type": "application/json"})
         with urllib.request.urlopen(req, timeout=10) as res:
             cookies = res.headers.get_all("set-cookie") or []
-        self.send_response(302)
-        for cookie in cookies:
-            self.send_header("set-cookie", cookie)
-        self.send_header("location", "/"), self.send_header("cache-control", "no-store"), self.end_headers()
+        self.redirect(cookies)
 
     def log_message(self, *_):
         pass

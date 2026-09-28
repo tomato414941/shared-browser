@@ -30,6 +30,7 @@ services:
       NEKO_SERVER_PROXY: "true"
       NEKO_SERVER_BIND: 127.0.0.1:8081    # nginx fronts it on 8080 and adds /go/<token>
       NEKO_SESSION_COOKIE_ENABLED: "true"
+      NEKO_SESSION_COOKIE_NAME: shared_browser_${SB_NAME}
       NEKO_SESSION_COOKIE_SECURE: ${SB_COOKIE_SECURE}
       NEKO_SESSION_COOKIE_EXPIRATION: ${SB_SESSION_HOURS}h
       NEKO_SESSION_FILE: /home/neko/profile/neko-sessions.json   # sessions outlive a restart, next to the profile
