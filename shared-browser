@@ -74,7 +74,7 @@ def write_env(name, values):
 
 
 def port_free(port):
-    # Bind on every address, TCP and UDP: a port taken on one interface (say, a tailnet address) is not free.
+    # Bind on every address, TCP and UDP: a port taken on one interface (say, a VPN address) is not free.
     for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
         with socket.socket(socket.AF_INET, kind) as s:
             try:
@@ -103,10 +103,7 @@ def next_port(start, taken):
 
 
 def public_ip():
-    try:
-        return subprocess.run(["tailscale", "ip", "-4"], capture_output=True, text=True, timeout=3).stdout.strip() or None
-    except (OSError, subprocess.SubprocessError):
-        pass
+    """The address this machine uses to reach others. Pass SB_PUBLIC_IP to `new` for any other network, such as a VPN."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         try:
             s.connect(("192.0.2.1", 1))
@@ -119,7 +116,7 @@ def compose(name, *args, **kwargs):
     # Defaults added after an instance was created still apply: compose reads a merged copy, not the instance file.
     values = read_env(name)
     Path(values["SB_PROFILE_DIR"]).mkdir(parents=True, exist_ok=True, mode=0o700)
-    merged = env_path(name).with_suffix(".merged.env")
+    merged = INSTANCES / f".{name}.compose-env"   # not *.env, so ls and port counting never see it
     fd = os.open(merged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         for key, value in values.items():
@@ -143,7 +140,6 @@ def cmd_new(name, overrides):
         "SB_CDP_PORT": next_port(9242, taken),
         "SB_WEBRTC_PORT": next_port(59000, taken),
         "SB_PROFILE_DIR": Path.home() / ".local/share/shared-browser" / name,
-        "SB_PUBLIC_IP": public_ip(),
         **DEFAULTS,
         "SB_USER_PASSWORD": secrets.token_urlsafe(9),
         "SB_ADMIN_PASSWORD": secrets.token_urlsafe(9),
@@ -153,6 +149,10 @@ def cmd_new(name, overrides):
         if not key.startswith("SB_") or not value:
             sys.exit(f"Bad override: {item}")
         values[key] = value
+    # WebRTC is published on the address clients reach, not on every interface: Docker publishes past host firewalls.
+    values.setdefault("SB_PUBLIC_IP", public_ip())
+    if "SB_WEBRTC_BIND=" not in " ".join(overrides):
+        values["SB_WEBRTC_BIND"] = values["SB_PUBLIC_IP"]
     path = write_env(name, values)
     print(path)
 

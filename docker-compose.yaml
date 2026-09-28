@@ -11,7 +11,7 @@ services:
     ports:
       - "127.0.0.1:${SB_WEB_PORT}:8080"      # viewer (put a reverse proxy in front to reach it remotely)
       - "127.0.0.1:${SB_CDP_PORT}:9223"      # CDP, unauthenticated: loopback only
-      - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/udp"   # Docker publishes past ufw; bind to the address clients use
+      - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/udp"   # Docker publishes past host firewalls; bind to the address clients use
       - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/tcp"
     volumes:
       - "${SB_PROFILE_DIR}:/home/neko/profile"

@@ -23,6 +23,7 @@ class GateTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.links = Path(self.tmp.name) / "links.json"
         self.logins = 0
+        self.neko_ready = True
         test = self
 
         class Backend(BaseHTTPRequestHandler):
@@ -36,6 +37,9 @@ class GateTests(unittest.TestCase):
 
             def do_POST(self):
                 data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                if not test.neko_ready:
+                    self.send_error(502)
+                    return
                 if self.path != "/api/login" or data.get("password") != "test-password":
                     self.send_error(401)
                     return
@@ -84,15 +88,54 @@ class GateTests(unittest.TestCase):
         }]))
         return self.root + "/go/one-time-token"
 
-    def test_fresh_link_creates_a_viewer_session(self):
+    def press(self, url):
+        return self.browser.open(urllib.request.Request(url, data=b"", method="POST"))
+
+    def test_opening_a_link_shows_a_button_that_posts_back(self):
         with self.browser.open(self.link()) as response:
+            page = response.read().decode()
+        self.assertIn('method="post"', page)
+        self.assertIn('action="/go/one-time-token"', page)
+        self.assertEqual(self.logins, 0)
+
+    def test_link_previews_leave_the_link_usable(self):
+        url = self.link()
+        self.browser.open(urllib.request.Request(url, method="HEAD")).close()
+        self.browser.open(url).close()
+        with self.press(url) as response:
+            self.assertEqual(response.geturl(), self.root + "/")
+        self.assertEqual(self.logins, 1)
+
+    def test_pressing_the_button_creates_a_viewer_session(self):
+        with self.press(self.link()) as response:
             self.assertEqual(response.geturl(), self.root + "/")
             self.assertEqual(response.read(), b"viewer")
         self.assertEqual(self.logins, 1)
         self.assertEqual([c.name for c in self.cookies], ["shared_browser_test"])
 
+    def test_a_link_logs_in_only_once(self):
+        url = self.link()
+        self.press(url).close()
+        self.cookies.clear()
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.press(url)
+        self.assertEqual(error.exception.code, 404)
+        self.assertEqual(self.logins, 1)
+
+    def test_link_stays_usable_when_the_browser_is_not_ready(self):
+        url = self.link()
+        self.neko_ready = False
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.press(url)
+        self.assertEqual(error.exception.code, 503)
+        self.neko_ready = True
+        with self.press(url) as response:
+            self.assertEqual(response.geturl(), self.root + "/")
+        self.assertEqual(self.logins, 1)
+
     def test_authenticated_viewer_reopens_a_used_link(self):
         url = self.link()
+        self.press(url).close()
         for _ in range(2):
             with self.browser.open(url) as response:
                 self.assertEqual(response.geturl(), self.root + "/")
@@ -101,8 +144,7 @@ class GateTests(unittest.TestCase):
 
     def test_authenticated_viewer_reopens_an_expired_link(self):
         url = self.link()
-        with self.browser.open(url) as response:
-            response.read()
+        self.press(url).close()
         self.link(expires=time.time() - 1)
         with self.browser.open(url) as response:
             self.assertEqual(response.geturl(), self.root + "/")
@@ -110,8 +152,7 @@ class GateTests(unittest.TestCase):
 
     def test_signed_out_viewer_needs_a_fresh_link(self):
         url = self.link()
-        with self.browser.open(url) as response:
-            response.read()
+        self.press(url).close()
         self.cookies.clear()
         with self.assertRaises(urllib.error.HTTPError) as error:
             self.browser.open(url)
