@@ -5,8 +5,11 @@ GET /go/<token> only shows a button, so link previews in chat apps do not use th
 POST /go/<token> uses the link, logs in to neko, and hands the session cookie to the browser that pressed the button.
 A browser that already has a session goes straight to the viewer, whatever the state of the link.
 
-/cdp/... passes the Chrome DevTools Protocol through to the browser for a principal whose key allows "cdp".
-The key travels in the Authorization header, so it stays out of URLs and logs.
+/cdp/... passes the Chrome DevTools Protocol through to the browser for a principal whose key allows "cdp",
+and /mcp passes Model Context Protocol requests to the bundled MCP server for one whose key allows "mcp".
+Keys travel in the Authorization header, so they stay out of URLs and logs.
+
+Revoking a principal takes effect at once: its open connections are closed and its viewer sessions ended.
 """
 import fcntl
 import hashlib
@@ -30,6 +33,12 @@ PASSWORD = os.environ["GATE_PASSWORD"]
 GRANTS = Path(os.environ.get("GATE_GRANTS", "/home/neko/profile/grants.json"))
 CDP = os.environ.get("GATE_CDP", "127.0.0.1:9222")
 BASE = os.environ.get("GATE_BASE", "").rstrip("/")   # the URL people and agents use to reach this browser
+MCP = os.environ.get("GATE_MCP", "localhost:8083")    # the bundled MCP server only answers to this Host
+ADMIN_PASSWORD = os.environ.get("GATE_ADMIN_PASSWORD", "")
+
+# Open connections through the gate, so a revocation can close them: id -> (key digest, ability, sockets).
+ACTIVE = {}
+ACTIVE_LOCK = threading.Lock()
 
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -86,21 +95,89 @@ def principal(name):
     return grant if grant and not grant.get("revoked") else None
 
 
-def holder(key):
-    """(name, grant) for an unexpired, unrevoked key, or (None, None)."""
+def digest(key):
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def holder(key_digest):
+    """(name, grant) for an unexpired key of an unrevoked principal, or (None, None)."""
     try:
         grants = json.loads(GRANTS.read_text())
     except (OSError, ValueError):
         return None, None
-    digest = hashlib.sha256(key.encode()).hexdigest()
     now = time.time()
     for name, grant in grants.items():
         if grant.get("revoked"):
             continue
         for k in grant.get("keys", []):
-            if k["hash"] == digest and (not k.get("expires") or k["expires"] > now):
+            if k["hash"] == key_digest and (not k.get("expires") or k["expires"] > now):
                 return name, grant
     return None, None
+
+
+def allowed(key_digest, ability):
+    return ability in (holder(key_digest)[1] or {}).get("can", [])
+
+
+def neko(method, path, cookie=None, body=None):
+    """Call neko's API. Returns (parsed body, session cookie it set). neko hands out sessions only as cookies here."""
+    headers = {"content-type": "application/json"}
+    if cookie:
+        headers["Cookie"] = cookie
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(NEKO + path, data=data, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=10) as res:
+        text = res.read()
+        set_cookie = next((c.split(";", 1)[0] for c in res.headers.get_all("set-cookie") or []), None)
+        return (json.loads(text) if text.strip() else None), set_cookie
+
+
+_last_grants = None
+
+
+def enforce():
+    """Close connections whose key no longer allows them, and end viewer sessions of principals who may not view."""
+    with ACTIVE_LOCK:
+        stale = [(i, socks) for i, (d, ability, socks) in ACTIVE.items() if not allowed(d, ability)]
+    for _, socks in stale:
+        for sock in socks:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    global _last_grants
+    try:
+        stamp = GRANTS.stat().st_mtime_ns
+        grants = json.loads(GRANTS.read_text())
+    except (OSError, ValueError):
+        return
+    if stamp == _last_grants or not ADMIN_PASSWORD:
+        return
+    _last_grants = stamp
+    barred = {name for name, g in grants.items() if g.get("revoked") or "view" not in g.get("can", [])}
+    if not barred:
+        return
+    try:
+        _, cookie = neko("POST", "/api/login", body={"username": "gate", "password": ADMIN_PASSWORD})
+        if not cookie:
+            raise ValueError("neko set no session cookie")
+        try:
+            sessions, _ = neko("GET", "/api/sessions", cookie)
+            for session in sessions or []:
+                if session.get("profile", {}).get("name") in barred:
+                    neko("DELETE", f"/api/sessions/{session['id']}", cookie)
+        finally:
+            neko("POST", "/api/logout", cookie)
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"could not end viewer sessions: {error!r}", flush=True)
+        _last_grants = None   # try again on the next pass
+
+
+def watch():
+    while True:
+        enforce()
+        time.sleep(2)
 
 
 def release(token):
@@ -145,15 +222,29 @@ class Gate(BaseHTTPRequestHandler):
         self.send_header("cache-control", "no-store")
         self.end_headers()
 
+    def door_for_path(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/cdp" or path.startswith("/cdp/"):
+            return "cdp"
+        if path == "/mcp" or path.startswith("/mcp/"):
+            return "mcp"
+        return None
+
     def do_GET(self):
-        if self.path.startswith("/cdp/") or self.path == "/cdp":
-            self.cdp()
+        if self.door_for_path():
+            self.door(self.door_for_path())
         else:
             self.show()
 
     def do_PUT(self):
-        if self.path.startswith("/cdp/"):
-            self.cdp()
+        if self.door_for_path():
+            self.door(self.door_for_path())
+        else:
+            self.page(405, GONE)
+
+    def do_DELETE(self):
+        if self.door_for_path():
+            self.door(self.door_for_path())
         else:
             self.page(405, GONE)
 
@@ -174,18 +265,22 @@ class Gate(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def cdp(self):
+    def door(self, ability):
         auth = self.headers.get("Authorization", "")
-        name, grant = holder(auth[7:]) if auth.startswith("Bearer ") else (None, None)
+        key_digest = digest(auth[7:]) if auth.startswith("Bearer ") else None
+        name, grant = holder(key_digest) if key_digest else (None, None)
         if not grant:
             self.refuse(401, "A key is required.")
             return
-        if "cdp" not in grant.get("can", []):
-            self.refuse(403, f"{name} may not use CDP.")
+        if ability not in grant.get("can", []):
+            self.refuse(403, f"{name} may not use {ability}.")
+            return
+        if ability == "mcp":
+            self.tunnel(MCP, self.path, key_digest, ability, close=True)
             return
         path = self.path[len("/cdp"):] or "/"
         if self.headers.get("Upgrade", "").lower() == "websocket":
-            self.tunnel(path)
+            self.tunnel(CDP, path, key_digest, ability)
         else:
             self.relay(path)
 
@@ -208,19 +303,29 @@ class Gate(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def tunnel(self, path):
-        """Hand a WebSocket over to Chrome and copy bytes both ways until either side closes."""
-        host, port = CDP.split(":")
+    def tunnel(self, target, path, key_digest, ability, close=False):
+        """Pass the request on to target and copy bytes both ways until either side closes.
+
+        With close, the upstream is asked to end the connection after one response, so a second request can never
+        ride on a connection that was checked only once.
+        """
+        host, port = target.split(":")
         try:
             upstream = socket.create_connection((host, int(port)), timeout=10)
         except OSError:
             self.refuse(503, "The browser is not ready.")
             return
         upstream.settimeout(None)
-        lines = [f"GET {path} HTTP/1.1", f"Host: {CDP}"]
-        lines += [f"{k}: {v}" for k, v in self.headers.items() if k.lower() not in ("host", "authorization")]
+        skip = {"host", "authorization"} | ({"connection", "keep-alive"} if close else set())
+        lines = [f"{self.command} {path} HTTP/1.1", f"Host: {target}"]
+        lines += [f"{k}: {v}" for k, v in self.headers.items() if k.lower() not in skip]
+        if close:
+            lines.append("Connection: close")
         upstream.sendall(("\r\n".join(lines) + "\r\n\r\n").encode())
         self.close_connection = True
+        tunnel_id = id(upstream)
+        with ACTIVE_LOCK:
+            ACTIVE[tunnel_id] = (key_digest, ability, (upstream, self.connection))
 
         def pump(read, write):
             try:
@@ -235,11 +340,15 @@ class Gate(BaseHTTPRequestHandler):
                     except OSError:
                         pass
 
-        back = threading.Thread(target=pump, args=(upstream.recv, self.connection.sendall), daemon=True)
-        back.start()
-        pump(self.rfile.read1, upstream.sendall)
-        back.join()
-        upstream.close()
+        try:
+            back = threading.Thread(target=pump, args=(upstream.recv, self.connection.sendall), daemon=True)
+            back.start()
+            pump(self.rfile.read1, upstream.sendall)
+            back.join()
+        finally:
+            with ACTIVE_LOCK:
+                ACTIVE.pop(tunnel_id, None)
+            upstream.close()
 
     def do_HEAD(self):
         self.show(head_only=True)
@@ -255,6 +364,9 @@ class Gate(BaseHTTPRequestHandler):
             self.page(404, GONE, head_only)
 
     def do_POST(self):
+        if self.door_for_path():
+            self.door(self.door_for_path())
+            return
         if self.has_session():
             self.redirect(status=303)
             return
@@ -276,4 +388,5 @@ class Gate(BaseHTTPRequestHandler):
         self.redirect(cookies, status=303)
 
 if __name__ == "__main__":
+    threading.Thread(target=watch, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", 8082), Gate).serve_forever()

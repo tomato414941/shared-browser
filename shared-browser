@@ -27,7 +27,7 @@ DEFAULTS = {
     "SB_VIDEO_PIPELINES": "{}",
     "SB_VIEWER_URL": "",
 }
-ABILITIES = ("view", "cdp")
+ABILITIES = ("view", "cdp", "mcp")
 
 
 def usage():
@@ -40,11 +40,12 @@ def usage():
         "  restart <name>\n"
         "  status <name>\n"
         "  endpoint <name> [--env]      Print where the browser is: CDP for agents, the viewer for people.\n"
-        "  grant <name> --as who --can view,cdp [--days N]\n"
-        "                               Let a principal (a person, an AI, anything) use the browser. With cdp,\n"
-        "                               prints a key once; send it as 'Authorization: Bearer <key>' to <viewer>/cdp.\n"
+        "  grant <name> --as who --can view,cdp,mcp [--days N]\n"
+        "                               Let a principal (a person, an AI, anything) use the browser. With cdp or\n"
+        "                               mcp, prints a key once; send it as 'Authorization: Bearer <key>' to\n"
+        "                               <viewer>/cdp or <viewer>/mcp.\n"
         "  grants <name>                List principals and what they may do.\n"
-        "  revoke <name> --as who       Stop a principal: its keys and unused links stop working.\n"
+        "  revoke <name> --as who       Stop a principal at once: keys, links, open connections, viewer sessions.\n"
         "  link <name> [--minutes N] [--as who]\n"
         "                               Print a one-time link that logs a principal in to the viewer; valid 10 minutes.\n"
         "  ls                           List instances.\n"
@@ -206,7 +207,7 @@ def cmd_grant(name, rest):
         grant = items.setdefault(who, {"keys": []})
         grant.pop("revoked", None)
         grant["can"] = can
-        if "cdp" in can:
+        if "cdp" in can or "mcp" in can:
             key = "sb_" + secrets.token_urlsafe(32)
             days = opts.get("days")
             grant["keys"].append({
@@ -269,6 +270,7 @@ def cmd_endpoint(name, as_env):
     out = {
         "name": name,
         "cdp_url": f"{viewer}/cdp",
+        "mcp_url": f"{viewer}/mcp",
         "cdp_local_url": f"http://127.0.0.1:{values['SB_CDP_PORT']}",
         "viewer_url": viewer,
         "viewer_password": values["SB_USER_PASSWORD"],

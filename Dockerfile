@@ -23,6 +23,10 @@ WORKDIR /src
 COPY tests/session_test.go internal/http/legacy/cookie_session_test.go
 RUN go test ./internal/http/legacy && go build -o /usr/bin/neko -ldflags "-s -w" ./cmd/neko
 
+FROM node:24-slim AS mcp
+ARG PLAYWRIGHT_MCP_VERSION=0.0.83
+RUN npm install --prefix /opt/mcp --no-audit --no-fund --loglevel=error "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}"
+
 FROM ghcr.io/m1k1o/neko/base:${NEKO_VERSION}
 ARG CHROME_DEB=https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 RUN set -eux; \
@@ -34,6 +38,8 @@ RUN set -eux; \
 
 COPY --from=client /neko/client/dist /var/www
 COPY --from=server /usr/bin/neko /usr/bin/neko
+COPY --from=mcp /usr/local/bin/node /usr/local/bin/node
+COPY --from=mcp /opt/mcp /opt/mcp
 COPY supervisord.conf /etc/neko/supervisord/chrome.conf
 COPY policies.json /etc/opt/chrome/policies/managed/policies.json
 COPY nginx.conf /etc/neko/nginx.conf

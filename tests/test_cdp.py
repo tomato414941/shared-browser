@@ -45,6 +45,73 @@ class FakeChrome(BaseHTTPRequestHandler):
         pass
 
 
+class FakeMcp(BaseHTTPRequestHandler):
+    """Answers like the bundled MCP server: only to its own Host, streaming the reply as server-sent events."""
+    seen = []
+    protocol_version = "HTTP/1.1"
+
+    def do_POST(self):
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        FakeMcp.seen.append((self.path, self.headers.get("Host"), self.headers.get("Authorization"),
+                             self.headers.get("Connection"), body))
+        if self.headers.get("Host") != self.server.expected_host:
+            self.send_response(403)
+            self.send_header("content-length", "0")
+            self.end_headers()
+            return
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("transfer-encoding", "chunked")
+        self.end_headers()
+        for part in (b"event: message\n", b'data: {"jsonrpc":"2.0","id":1,"result":{}}\n\n'):
+            self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
+
+    def log_message(self, *_):
+        pass
+
+
+class FakeNeko(BaseHTTPRequestHandler):
+    """The part of neko's API the gate uses to end viewer sessions. With cookies enabled, as the gate runs it,
+    neko answers a login with a session cookie and no token, and wants that cookie back on every call."""
+    sessions = []
+    deleted = []
+
+    def reply(self, obj, status=200, cookie=None):
+        body = json.dumps(obj).encode()
+        self.send_response(status)
+        if cookie:
+            self.send_header("set-cookie", cookie)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def admin(self):
+        return self.headers.get("Cookie") == "shared_browser_test=admin"
+
+    def do_POST(self):
+        data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        if self.path == "/api/login":
+            ok = data.get("password") == "admin-password"
+            self.reply({"id": "gate-1"} if ok else {}, 200 if ok else 401,
+                       "shared_browser_test=admin; Path=/; HttpOnly" if ok else None)
+        else:
+            self.reply({}, 200 if self.admin() else 401)
+
+    def do_GET(self):
+        self.reply(FakeNeko.sessions if self.admin() else {}, 200 if self.admin() else 401)
+
+    def do_DELETE(self):
+        if self.admin():
+            FakeNeko.deleted.append(self.path)
+        self.reply({}, 200 if self.admin() else 401)
+
+    def log_message(self, *_):
+        pass
+
+
 def serve(test, handler):
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -64,10 +131,17 @@ class CdpTests(unittest.TestCase):
             "claude": {"can": ["cdp"], "keys": [{"hash": digest("good-key"), "expires": None}]},
             "tomato": {"can": ["view"], "keys": [{"hash": digest("view-key"), "expires": None}]},
             "old": {"can": ["cdp"], "keys": [{"hash": digest("old-key"), "expires": 1}]},
+            "helper": {"can": ["mcp"], "keys": [{"hash": digest("mcp-key"), "expires": None}]},
         }))
+        FakeMcp.seen, FakeNeko.sessions, FakeNeko.deleted = [], [], []
+        mcp = serve(self, FakeMcp)
+        mcp.expected_host = f"localhost:{mcp.server_port}"
+        neko = serve(self, FakeNeko)
         chrome = serve(self, FakeChrome)
         self.chrome = f"127.0.0.1:{chrome.server_port}"
-        settings = patch.multiple(gate, GRANTS=self.grants, CDP=self.chrome, BASE="https://browser.example")
+        settings = patch.multiple(gate, GRANTS=self.grants, CDP=self.chrome, BASE="https://browser.example",
+                                  MCP=mcp.expected_host, NEKO=f"http://127.0.0.1:{neko.server_port}",
+                                  ADMIN_PASSWORD="admin-password", _last_grants=None)
         settings.start()
         self.addCleanup(settings.stop)
         self.gate = serve(self, gate.Gate)
@@ -103,6 +177,76 @@ class CdpTests(unittest.TestCase):
         grants["claude"]["revoked"] = True
         self.grants.write_text(json.dumps(grants))
         self.assertEqual(self.status("/cdp/json/version", "good-key"), 401)
+
+    def revoke(self, name):
+        grants = json.loads(self.grants.read_text())
+        grants[name]["revoked"] = True
+        grants[name]["keys"] = []
+        self.grants.write_text(json.dumps(grants))
+
+    def open_websocket(self, key="good-key"):
+        sock = socket.create_connection(("127.0.0.1", self.gate.server_port), timeout=5)
+        sock.sendall(b"GET /cdp/devtools/browser/abc HTTP/1.1\r\nHost: browser.example\r\n"
+                     b"Upgrade: websocket\r\nConnection: Upgrade\r\nAuthorization: Bearer " + key.encode() + b"\r\n\r\n")
+        reply = b""
+        while b"\r\n\r\n" not in reply:
+            reply += sock.recv(1024)
+        return sock, reply
+
+    def test_mcp_requests_reach_the_bundled_server_as_its_own_host_without_the_key(self):
+        body = b'{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+        req = urllib.request.Request(f"http://127.0.0.1:{self.gate.server_port}/mcp", data=body, method="POST",
+                                     headers={"Authorization": "Bearer mcp-key", "content-type": "application/json"})
+        with urllib.request.urlopen(req) as res:
+            self.assertEqual(res.headers["content-type"], "text/event-stream")
+            self.assertIn(b'"result"', res.read())
+        path, host, auth, connection, sent = FakeMcp.seen[-1]
+        self.assertEqual((path, host, auth, connection, sent), ("/mcp", self.gate_mcp_host(), None, "close", body))
+
+    def gate_mcp_host(self):
+        return gate.MCP
+
+    def test_mcp_needs_the_mcp_ability(self):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.gate.server_port}/mcp", data=b"{}", method="POST",
+                                     headers={"Authorization": "Bearer good-key"})
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            urllib.request.urlopen(req)
+        self.assertEqual(error.exception.code, 403)
+        self.assertEqual(FakeMcp.seen, [])
+
+    def test_revoking_closes_open_connections_at_once(self):
+        sock, reply = self.open_websocket()
+        self.assertTrue(reply.startswith(b"HTTP/1.1 101"))
+        self.revoke("claude")
+        gate.enforce()
+        sock.settimeout(5)
+        rest = b""
+        try:
+            while chunk := sock.recv(1024):
+                rest += chunk
+        except OSError:
+            pass
+        self.assertEqual(rest, b"")
+        sock.close()
+
+    def test_other_principals_stay_connected_when_one_is_revoked(self):
+        sock, _ = self.open_websocket()
+        self.revoke("helper")
+        gate.enforce()
+        sock.sendall(b"still")
+        sock.settimeout(5)
+        self.assertEqual(sock.recv(1024), b"still")
+        sock.close()
+
+    def test_revoking_ends_the_principals_viewer_sessions(self):
+        FakeNeko.sessions = [{"id": "tomato-1", "profile": {"name": "tomato"}},
+                             {"id": "friend-1", "profile": {"name": "friend"}}]
+        grants = json.loads(self.grants.read_text())
+        grants["friend"] = {"can": ["view"], "keys": []}
+        self.grants.write_text(json.dumps(grants))
+        self.revoke("tomato")
+        gate.enforce()
+        self.assertEqual(FakeNeko.deleted, ["/api/sessions/tomato-1"])
 
     def test_websocket_is_carried_both_ways_without_the_key(self):
         with socket.create_connection(("127.0.0.1", self.gate.server_port), timeout=5) as sock:
