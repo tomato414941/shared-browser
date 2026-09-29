@@ -65,8 +65,10 @@ class GateTests(unittest.TestCase):
 
         self.server = self.serve(ViewerGate)
         self.root = f"http://127.0.0.1:{self.server.server_port}"
+        self.grants = Path(self.tmp.name) / "grants.json"
+        self.grants.write_text(json.dumps({"viewer": {"can": ["view"], "keys": []}}))
         self.settings = patch.multiple(
-            gate, LINKS=self.links, NEKO=f"http://127.0.0.1:{self.backend.server_port}"
+            gate, LINKS=self.links, GRANTS=self.grants, NEKO=f"http://127.0.0.1:{self.backend.server_port}"
         )
         self.settings.start()
         self.addCleanup(self.settings.stop)
@@ -149,6 +151,14 @@ class GateTests(unittest.TestCase):
         with self.browser.open(url) as response:
             self.assertEqual(response.geturl(), self.root + "/")
         self.assertEqual(self.logins, 1)
+
+    def test_link_of_a_revoked_principal_does_not_log_in(self):
+        url = self.link()
+        self.grants.write_text(json.dumps({"viewer": {"can": ["view"], "keys": [], "revoked": True}}))
+        with self.assertRaises(urllib.error.HTTPError) as error:
+            self.press(url)
+        self.assertEqual(error.exception.code, 404)
+        self.assertEqual(self.logins, 0)
 
     def test_signed_out_viewer_needs_a_fresh_link(self):
         url = self.link()

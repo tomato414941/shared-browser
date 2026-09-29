@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """Run shared browsers: one instance file, one container, one CDP address."""
+import fcntl
+import hashlib
 import json
 import os
 import secrets
 import socket
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -21,7 +25,9 @@ DEFAULTS = {
     "SB_VIDEO_CODEC": "vp8",
     "SB_VIDEO_IDS": "main",
     "SB_VIDEO_PIPELINES": "{}",
+    "SB_VIEWER_URL": "",
 }
+ABILITIES = ("view", "cdp")
 
 
 def usage():
@@ -34,8 +40,13 @@ def usage():
         "  restart <name>\n"
         "  status <name>\n"
         "  endpoint <name> [--env]      Print where the browser is: CDP for agents, the viewer for people.\n"
+        "  grant <name> --as who --can view,cdp [--days N]\n"
+        "                               Let a principal (a person, an AI, anything) use the browser. With cdp,\n"
+        "                               prints a key once; send it as 'Authorization: Bearer <key>' to <viewer>/cdp.\n"
+        "  grants <name>                List principals and what they may do.\n"
+        "  revoke <name> --as who       Stop a principal: its keys and unused links stop working.\n"
         "  link <name> [--minutes N] [--as who]\n"
-        "                               Print a one-time link that logs a person in; valid 10 minutes by default.\n"
+        "                               Print a one-time link that logs a principal in to the viewer; valid 10 minutes.\n"
         "  ls                           List instances.\n"
         "Instance keys: SB_WEB_PORT SB_CDP_PORT SB_WEBRTC_PORT SB_WEBRTC_BIND SB_PROFILE_DIR SB_PUBLIC_IP SB_HOME_URL SB_LANG\n"
         "  SB_CHROME_FLAGS SB_SCREEN SB_VIDEO_CODEC SB_VIDEO_IDS SB_VIDEO_PIPELINES SB_COOKIE_SECURE SB_SESSION_HOURS SB_VIEWER_URL SB_USER_PASSWORD SB_ADMIN_PASSWORD",
@@ -157,19 +168,84 @@ def cmd_new(name, overrides):
     print(path)
 
 
-def cmd_link(name, rest):
-    import fcntl, time
-    values = read_env(name)
-    minutes, who = 10, "viewer"
-    args = list(rest)
+def flags(rest, known):
+    """Parse --flag value pairs into a dict; anything else is a usage error."""
+    out, args = {}, list(rest)
     while args:
         flag = args.pop(0)
-        if flag == "--minutes" and args:
-            minutes = int(args.pop(0))
-        elif flag == "--as" and args:
-            who = args.pop(0)
+        if flag.startswith("--") and flag[2:] in known and args:
+            out[flag[2:]] = args.pop(0)
         else:
             usage()
+    return out
+
+
+@contextmanager
+def grants(name):
+    """The instance's principals, locked for update. Keys are kept only as hashes."""
+    path = Path(read_env(name)["SB_PROFILE_DIR"]) / "grants.json"
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            items = json.load(f)
+        except ValueError:
+            items = {}
+        yield items
+        f.seek(0), f.truncate(), json.dump(items, f, indent=2)
+
+
+def cmd_grant(name, rest):
+    opts = flags(rest, ("as", "can", "days"))
+    who, can = opts.get("as"), [c for c in opts.get("can", "").split(",") if c]
+    if not who or not can or any(c not in ABILITIES for c in can):
+        sys.exit(f"grant needs --as <who> and --can with any of: {', '.join(ABILITIES)}")
+    key = None
+    with grants(name) as items:
+        grant = items.setdefault(who, {"keys": []})
+        grant.pop("revoked", None)
+        grant["can"] = can
+        if "cdp" in can:
+            key = "sb_" + secrets.token_urlsafe(32)
+            days = opts.get("days")
+            grant["keys"].append({
+                "hash": hashlib.sha256(key.encode()).hexdigest(),
+                "created": time.time(),
+                "expires": time.time() + float(days) * 86400 if days else None,
+            })
+    print(json.dumps({"as": who, "can": can, **({"key": key} if key else {})}, indent=2))
+
+
+def cmd_grants(name):
+    with grants(name) as items:
+        now = time.time()
+        for who, grant in sorted(items.items()):
+            live = [k for k in grant.get("keys", []) if not k.get("expires") or k["expires"] > now]
+            state = "revoked" if grant.get("revoked") else ",".join(grant.get("can", []))
+            print(f"{who}\t{state}\tkeys={len(live)}")
+
+
+def cmd_revoke(name, rest):
+    who = flags(rest, ("as",)).get("as") or usage()
+    with grants(name) as items:
+        if who not in items:
+            sys.exit(f"No principal '{who}'.")
+        items[who]["revoked"] = True
+        items[who]["keys"] = []
+    print(f"revoked {who}")
+
+
+def cmd_link(name, rest):
+    values = read_env(name)
+    opts = flags(rest, ("minutes", "as"))
+    minutes, who = int(opts.get("minutes", 10)), opts.get("as", "viewer")
+    with grants(name) as items:
+        grant = items.get(who)
+        if grant and (grant.get("revoked") or "view" not in grant.get("can", [])):
+            sys.exit(f"{who} may not view. Grant it first: shared-browser grant {name} --as {who} --can view")
+        if not grant:
+            items[who] = {"can": ["view"], "keys": []}
     links = Path(values["SB_PROFILE_DIR"]) / "links.json"
     links.touch(mode=0o600, exist_ok=True)
     token = secrets.token_urlsafe(24)
@@ -189,10 +265,12 @@ def cmd_link(name, rest):
 
 def cmd_endpoint(name, as_env):
     values = read_env(name)
+    viewer = values.get("SB_VIEWER_URL") or f"http://127.0.0.1:{values['SB_WEB_PORT']}"
     out = {
         "name": name,
-        "cdp_url": f"http://127.0.0.1:{values['SB_CDP_PORT']}",
-        "viewer_url": values.get("SB_VIEWER_URL") or f"http://127.0.0.1:{values['SB_WEB_PORT']}",
+        "cdp_url": f"{viewer}/cdp",
+        "cdp_local_url": f"http://127.0.0.1:{values['SB_CDP_PORT']}",
+        "viewer_url": viewer,
         "viewer_password": values["SB_USER_PASSWORD"],
         "admin_password": values["SB_ADMIN_PASSWORD"],
         "webrtc_port": int(values["SB_WEBRTC_PORT"]),
@@ -222,6 +300,12 @@ def main(argv):
         cmd_endpoint(rest[0], "--env" in rest[1:])
     elif command == "link" and rest:
         cmd_link(rest[0], rest[1:])
+    elif command == "grant" and rest:
+        cmd_grant(rest[0], rest[1:])
+    elif command == "grants" and len(rest) == 1:
+        cmd_grants(rest[0])
+    elif command == "revoke" and rest:
+        cmd_revoke(rest[0], rest[1:])
     else:
         usage()
 
