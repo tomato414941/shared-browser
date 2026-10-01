@@ -29,11 +29,18 @@ RUN npm install --prefix /opt/mcp --no-audit --no-fund --loglevel=error "@playwr
 
 FROM ghcr.io/m1k1o/neko/base:${NEKO_VERSION}
 ARG CHROME_DEB=https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+# Google Chrome where Google builds it (amd64); Debian's Chromium elsewhere. Either answers as /usr/local/bin/browser.
 RUN set -eux; \
     apt-get update; \
-    wget -qO /tmp/chrome.deb "$CHROME_DEB"; \
-    apt-get install -y --no-install-recommends openbox socat nginx /tmp/chrome.deb; \
-    rm -f /tmp/chrome.deb; \
+    apt-get install -y --no-install-recommends openbox socat nginx; \
+    if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+        wget -qO /tmp/chrome.deb "$CHROME_DEB"; \
+        apt-get install -y --no-install-recommends /tmp/chrome.deb; rm -f /tmp/chrome.deb; \
+        ln -s /usr/bin/google-chrome /usr/local/bin/browser; \
+    else \
+        apt-get install -y --no-install-recommends chromium; \
+        ln -s /usr/bin/chromium /usr/local/bin/browser; \
+    fi; \
     apt-get clean; rm -rf /var/lib/apt/lists/*
 
 COPY --from=client /neko/client/dist /var/www
@@ -42,5 +49,6 @@ COPY --from=mcp /usr/local/bin/node /usr/local/bin/node
 COPY --from=mcp /opt/mcp /opt/mcp
 COPY supervisord.conf /etc/neko/supervisord/chrome.conf
 COPY policies.json /etc/opt/chrome/policies/managed/policies.json
+COPY policies.json /etc/chromium/policies/managed/policies.json
 COPY nginx.conf /etc/neko/nginx.conf
 COPY gate.py /usr/local/bin/gate.py

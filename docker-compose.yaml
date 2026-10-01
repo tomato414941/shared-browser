@@ -11,7 +11,7 @@ services:
     ports:
       - "127.0.0.1:${SB_WEB_PORT}:8080"      # viewer (put a reverse proxy in front to reach it remotely)
       - "127.0.0.1:${SB_CDP_PORT}:9223"      # CDP, unauthenticated: loopback only
-      - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/udp"   # Docker publishes past host firewalls; bind to the address clients use
+      - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/udp"   # Docker publishes past host firewalls; narrow with SB_WEBRTC_BIND
       - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/tcp"
     volumes:
       - "${SB_PROFILE_DIR}:/home/neko/profile"
@@ -27,7 +27,9 @@ services:
       NEKO_WEBRTC_UDPMUX: ${SB_WEBRTC_PORT}
       NEKO_WEBRTC_TCPMUX: ${SB_WEBRTC_PORT}
       NEKO_WEBRTC_NAT1TO1: ${SB_PUBLIC_IP}
-      NEKO_WEBRTC_ICELITE: "1"
+      NEKO_WEBRTC_ICELITE: ${SB_ICE_LITE}
+      NEKO_WEBRTC_ICESERVERS_FRONTEND: ${SB_ICE_SERVERS}
+      NEKO_WEBRTC_ICESERVERS_BACKEND: ${SB_ICE_SERVERS}
       NEKO_SERVER_PROXY: "true"
       NEKO_SERVER_BIND: 127.0.0.1:8081    # nginx fronts it on 8080 and adds /go/<token>
       NEKO_SESSION_COOKIE_ENABLED: "true"
