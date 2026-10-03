@@ -11,10 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-with patch.dict("os.environ", {"GATE_PASSWORD": "test-password"}):
-    spec = importlib.util.spec_from_file_location("gate", Path(__file__).parents[1] / "gate.py")
-    gate = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(gate)
+spec = importlib.util.spec_from_file_location("gate", Path(__file__).parents[1] / "gate.py")
+gate = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gate)
 
 
 class FakeChrome(BaseHTTPRequestHandler):
@@ -72,46 +71,6 @@ class FakeMcp(BaseHTTPRequestHandler):
         pass
 
 
-class FakeNeko(BaseHTTPRequestHandler):
-    """The part of neko's API the gate uses to end viewer sessions. With cookies enabled, as the gate runs it,
-    neko answers a login with a session cookie and no token, and wants that cookie back on every call."""
-    sessions = []
-    deleted = []
-
-    def reply(self, obj, status=200, cookie=None):
-        body = json.dumps(obj).encode()
-        self.send_response(status)
-        if cookie:
-            self.send_header("set-cookie", cookie)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def admin(self):
-        return self.headers.get("Cookie") == "shared_browser_test=admin"
-
-    def do_POST(self):
-        data = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
-        if self.path == "/api/login":
-            ok = data.get("password") == "admin-password"
-            self.reply({"id": "gate-1"} if ok else {}, 200 if ok else 401,
-                       "shared_browser_test=admin; Path=/; HttpOnly" if ok else None)
-        else:
-            self.reply({}, 200 if self.admin() else 401)
-
-    def do_GET(self):
-        self.reply(FakeNeko.sessions if self.admin() else {}, 200 if self.admin() else 401)
-
-    def do_DELETE(self):
-        if self.admin():
-            FakeNeko.deleted.append(self.path)
-        self.reply({}, 200 if self.admin() else 401)
-
-    def log_message(self, *_):
-        pass
-
-
 def serve(test, handler):
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -133,15 +92,13 @@ class CdpTests(unittest.TestCase):
             "old": {"can": ["cdp"], "keys": [{"hash": digest("old-key"), "expires": 1}]},
             "helper": {"can": ["mcp"], "keys": [{"hash": digest("mcp-key"), "expires": None}]},
         }))
-        FakeMcp.seen, FakeNeko.sessions, FakeNeko.deleted = [], [], []
+        FakeMcp.seen = []
         mcp = serve(self, FakeMcp)
         mcp.expected_host = f"localhost:{mcp.server_port}"
-        neko = serve(self, FakeNeko)
         chrome = serve(self, FakeChrome)
         self.chrome = f"127.0.0.1:{chrome.server_port}"
         settings = patch.multiple(gate, GRANTS=self.grants, CDP=self.chrome, BASE="https://browser.example",
-                                  MCP=mcp.expected_host, NEKO=f"http://127.0.0.1:{neko.server_port}",
-                                  ADMIN_PASSWORD="admin-password", _last_grants=None)
+                                  MCP=mcp.expected_host)
         settings.start()
         self.addCleanup(settings.stop)
         self.gate = serve(self, gate.Gate)
@@ -237,16 +194,6 @@ class CdpTests(unittest.TestCase):
         sock.settimeout(5)
         self.assertEqual(sock.recv(1024), b"still")
         sock.close()
-
-    def test_revoking_ends_the_principals_viewer_sessions(self):
-        FakeNeko.sessions = [{"id": "tomato-1", "profile": {"name": "tomato"}},
-                             {"id": "friend-1", "profile": {"name": "friend"}}]
-        grants = json.loads(self.grants.read_text())
-        grants["friend"] = {"can": ["view"], "keys": []}
-        self.grants.write_text(json.dumps(grants))
-        self.revoke("tomato")
-        gate.enforce()
-        self.assertEqual(FakeNeko.deleted, ["/api/sessions/tomato-1"])
 
     def test_websocket_is_carried_both_ways_without_the_key(self):
         with socket.create_connection(("127.0.0.1", self.gate.server_port), timeout=5) as sock:

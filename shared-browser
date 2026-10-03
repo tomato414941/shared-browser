@@ -19,7 +19,6 @@ DEFAULTS = {
     "SB_LANG": "en",
     "SB_CHROME_FLAGS": "",
     "SB_SCREEN": "1440x960@30",
-    "SB_COOKIE_SECURE": "auto",       # auto: on when SB_VIEWER_URL is https, off otherwise
     "SB_PUBLIC_IP": "",               # the address WebRTC clients reach; empty lets STUN discover it
     "SB_STUN": "stun:stun.l.google.com:19302",
     "SB_SESSION_HOURS": "720",
@@ -36,6 +35,8 @@ CONTRACT = """What to put in front of an instance:
   unless set). Clients must reach that port directly; it does not pass through an HTTP front. Set SB_PUBLIC_IP
   to the address they reach it at, or leave it empty to let STUN (SB_STUN) discover it. Behind a NAT that
   blocks this, run a TURN server and pass it in SB_ICE_SERVERS as JSON.
+  People come in with a link from `link`; there is no password. A browser on plain HTTP keeps its session
+  too, so a viewer on a LAN works without a front.
   CDP for agents is 127.0.0.1:SB_CDP_PORT, and <SB_VIEWER_URL>/cdp or /mcp with a key from `grant`.
   `endpoint <name>` prints all of this for an instance; `config <name>` prints what it will run with."""
 ABILITIES = ("view", "cdp", "mcp")
@@ -44,7 +45,7 @@ ABILITIES = ("view", "cdp", "mcp")
 def usage():
     print(
         "Usage: shared-browser <command> [name]\n"
-        "  new <name> [KEY=VALUE ...]   Write instances/<name>.env with free ports and fresh passwords.\n"
+        "  new <name> [KEY=VALUE ...]   Write instances/<name>.env with free ports.\n"
         "  build                        Build the image (downloads Google Chrome).\n"
         "  up <name>                    Start the instance; restarts on its own after a reboot.\n"
         "  down <name>                  Stop it. The profile stays.\n"
@@ -62,8 +63,8 @@ def usage():
         "  config <name>                Print the settings the instance runs with, defaults filled in.\n"
         "  ls                           List instances.\n"
         "Instance keys: SB_WEB_PORT SB_CDP_PORT SB_WEBRTC_PORT SB_WEBRTC_BIND SB_PROFILE_DIR SB_PUBLIC_IP SB_HOME_URL SB_LANG\n"
-        "  SB_CHROME_FLAGS SB_SCREEN SB_VIDEO_CODEC SB_VIDEO_IDS SB_VIDEO_PIPELINES SB_COOKIE_SECURE SB_SESSION_HOURS\n"
-        "  SB_VIEWER_URL SB_STUN SB_ICE_SERVERS SB_USER_PASSWORD SB_ADMIN_PASSWORD\n"
+        "  SB_CHROME_FLAGS SB_SCREEN SB_VIDEO_CODEC SB_VIDEO_IDS SB_VIDEO_PIPELINES SB_SESSION_HOURS SB_VIEWER_URL\n"
+        "  SB_STUN SB_ICE_SERVERS\n"
         + CONTRACT,
         file=sys.stderr,
     )
@@ -131,8 +132,6 @@ def next_port(start, taken):
 def settings(name):
     """What the instance runs with: the instance file over the defaults, plus what follows from them."""
     values = read_env(name)
-    if values["SB_COOKIE_SECURE"] == "auto":
-        values["SB_COOKIE_SECURE"] = "true" if values["SB_VIEWER_URL"].startswith("https://") else "false"
     # With a known public address neko can run ICE lite; otherwise both sides discover addresses through STUN.
     if values.get("SB_ICE_SERVERS"):
         values["SB_ICE_LITE"] = "0"
@@ -173,8 +172,6 @@ def cmd_new(name, overrides):
         "SB_WEBRTC_PORT": next_port(59000, taken),
         "SB_PROFILE_DIR": Path.home() / ".local/share/shared-browser" / name,
         **DEFAULTS,
-        "SB_USER_PASSWORD": secrets.token_urlsafe(9),
-        "SB_ADMIN_PASSWORD": secrets.token_urlsafe(9),
     }
     for item in overrides:
         key, _, value = item.partition("=")
@@ -294,8 +291,6 @@ def cmd_endpoint(name, as_env):
         "webrtc_port": int(values["SB_WEBRTC_PORT"]),
         "webrtc_bind": values["SB_WEBRTC_BIND"],
         "public_ip": values["SB_PUBLIC_IP"] or None,
-        "viewer_password": values["SB_USER_PASSWORD"],
-        "admin_password": values["SB_ADMIN_PASSWORD"],
     }
     if as_env:
         for key, value in out.items():

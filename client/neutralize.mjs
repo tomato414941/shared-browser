@@ -1,4 +1,5 @@
-// Strip the neko name and logo from the client before it is built, so the viewer carries no brand.
+// Before the client is built: strip the neko name and logo so the viewer carries no brand, and remove its login
+// form. The gate has already let the person in, so the client joins the screen under the name the gate gives.
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
@@ -13,6 +14,15 @@ const edit = (path, fn) => {
 const logoBlock = /<div class="logo"[^>]*>[\s\S]*?<\/div>\n/;
 
 edit("src/components/connect.vue", s => s.replace(logoBlock, ""));
+edit("src/components/connect.vue", s => s.replace(/ *<form class="message"[\s\S]*?<\/form>\n/, ""));
+edit("src/components/connect.vue", s => s.replace('<div class="loader" v-if="connecting">', '<div class="loader">'));
+edit("src/components/connect.vue", s => s.replace(/    mounted\(\) \{[\s\S]*?\n    \}\n(?=\n    get connecting\(\))/, `    mounted() {
+      fetch('./whoami', { credentials: 'same-origin' })
+        .then((res) => (res.ok ? res.json() : Promise.reject()))
+        .then((who) => this.$accessor.login({ displayname: who.name, password: '-' }))
+        .catch(() => location.reload())
+    }
+`));
 edit("src/components/unsupported.vue", s => s.replace(logoBlock, ""));
 edit("src/components/header.vue", s => s.replace(/<a href="https:\/\/github.com\/m1k1o\/neko"[\s\S]*?<\/a>/, '<div class="neko"></div>'));
 edit("src/components/about.vue", s => s.replace(/<img src="@\/assets\/images\/logo.svg"[^>]*>\s*<span><b>N<\/b>\.EKO<\/span>/, ""));

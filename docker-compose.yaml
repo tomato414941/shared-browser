@@ -20,6 +20,8 @@ services:
       SB_LANG: ${SB_LANG}
       SB_CHROME_FLAGS: ${SB_CHROME_FLAGS}
       SB_VIEWER_URL: ${SB_VIEWER_URL}
+      SB_NAME: ${SB_NAME}
+      SB_SESSION_HOURS: ${SB_SESSION_HOURS}
       NEKO_DESKTOP_SCREEN: ${SB_SCREEN}
       NEKO_CAPTURE_VIDEO_CODEC: ${SB_VIDEO_CODEC}
       NEKO_CAPTURE_VIDEO_IDS: ${SB_VIDEO_IDS}
@@ -31,11 +33,5 @@ services:
       NEKO_WEBRTC_ICESERVERS_FRONTEND: ${SB_ICE_SERVERS}
       NEKO_WEBRTC_ICESERVERS_BACKEND: ${SB_ICE_SERVERS}
       NEKO_SERVER_PROXY: "true"
-      NEKO_SERVER_BIND: 127.0.0.1:8081    # nginx fronts it on 8080 and adds /go/<token>
-      NEKO_SESSION_COOKIE_ENABLED: "true"
-      NEKO_SESSION_COOKIE_NAME: shared_browser_${SB_NAME}
-      NEKO_SESSION_COOKIE_SECURE: ${SB_COOKIE_SECURE}
-      NEKO_SESSION_COOKIE_EXPIRATION: ${SB_SESSION_HOURS}h
-      NEKO_SESSION_FILE: /home/neko/profile/neko-sessions.json   # sessions outlive a restart, next to the profile
-      NEKO_MEMBER_MULTIUSER_USER_PASSWORD: ${SB_USER_PASSWORD}
-      NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD: ${SB_ADMIN_PASSWORD}
+      NEKO_SERVER_BIND: 127.0.0.1:8081    # reachable only through the gate, which nginx fronts on 8080
+      NEKO_MEMBER_PROVIDER: noauth         # who may come in is the gate's business, not neko's

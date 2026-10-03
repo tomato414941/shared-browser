@@ -78,12 +78,9 @@ class CliTests(unittest.TestCase):
         conf = self.config("d")
         self.assertEqual((conf["SB_ICE_LITE"], conf["SB_ICE_SERVERS"]), ("1", "[]"))
 
-    def test_cookies_are_secure_only_behind_https(self):
-        self.assertEqual(self.config("b")["SB_COOKIE_SECURE"], "true")
-        self.run_cli("new", "e", f"SB_PROFILE_DIR={self.root / 'e'}")
-        self.assertEqual(self.config("e")["SB_COOKIE_SECURE"], "false")
-        self.run_cli("new", "f", f"SB_PROFILE_DIR={self.root / 'f'}", "SB_COOKIE_SECURE=true")
-        self.assertEqual(self.config("f")["SB_COOKIE_SECURE"], "true")
+    def test_an_instance_has_no_passwords(self):
+        self.assertNotIn("PASSWORD", (self.root / "instances" / "b.env").read_text())
+        self.assertNotIn("password", self.run_cli("endpoint", "b").stdout)
 
     def test_endpoint_says_what_to_reach_and_whether_a_front_is_set(self):
         out = json.loads(self.run_cli("endpoint", "b").stdout)
