@@ -38,6 +38,7 @@ CONTRACT = """What to put in front of an instance:
   People come in with a link from `link`; there is no password. A browser on plain HTTP keeps its session
   too, so a viewer on a LAN works without a front.
   CDP for agents is 127.0.0.1:SB_CDP_PORT, and <SB_VIEWER_URL>/cdp or /mcp with a key from `grant`.
+  <viewer>/measure, opened by someone with a session, measures the screen's delay from the device it is opened on.
   `endpoint <name>` prints all of this for an instance; `config <name>` prints what it will run with."""
 ABILITIES = ("view", "cdp", "mcp")
 
@@ -284,6 +285,7 @@ def cmd_endpoint(name, as_env):
         "name": name,
         "viewer_url": viewer,
         "viewer_local_url": f"http://127.0.0.1:{values['SB_WEB_PORT']}",
+        "measure_url": f"{viewer}/measure",
         "viewer_url_is_set": bool(values.get("SB_VIEWER_URL")),
         "cdp_url": f"{viewer}/cdp",
         "mcp_url": f"{viewer}/mcp",

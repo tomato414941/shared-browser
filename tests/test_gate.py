@@ -37,9 +37,27 @@ class FakeScreen(BaseHTTPRequestHandler):
         pass
 
 
+class FakeChrome(BaseHTTPRequestHandler):
+    """Chrome's HTTP endpoint for tabs: opens one for PUT /json/new?<url>, closes one for /json/close/<id>."""
+    calls = []
+
+    def answer(self):
+        FakeChrome.calls.append((self.command, self.path))
+        body = json.dumps({"id": "TAB1"}).encode() if self.path.startswith("/json/new") else b"Target is closing"
+        self.send_response(200)
+        self.send_header("content-length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_GET = do_PUT = answer
+
+    def log_message(self, *_):
+        pass
+
+
 class GateTests(unittest.TestCase):
     def setUp(self):
-        FakeScreen.seen = []
+        FakeScreen.seen, FakeChrome.calls = [], []
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.links = Path(tmp.name) / "links.json"
@@ -47,7 +65,9 @@ class GateTests(unittest.TestCase):
         self.grants.write_text(json.dumps({"tomato": {"can": ["view"], "keys": []}}))
         screen = self.serve(FakeScreen)
         settings = patch.multiple(gate, LINKS=self.links, GRANTS=self.grants, SESSIONS=Path(tmp.name) / "sessions.json",
-                                  SCREEN=f"127.0.0.1:{screen.server_port}", BASE="")
+                                  SCREEN=f"127.0.0.1:{screen.server_port}", BASE="",
+                                  CDP=f"127.0.0.1:{self.serve(FakeChrome).server_port}",
+                                  MEASURE={"token": None, "tab": None, "flips": 0})
         settings.start()
         self.addCleanup(settings.stop)
         gate.Gate.log_message = lambda *_: None
@@ -196,6 +216,52 @@ class GateTests(unittest.TestCase):
         self.revoke("tomato")
         gate.enforce()
         self.assertEqual(sock.recv(1024), b"")
+
+    # --- measuring ---
+
+    def session(self):
+        return self.press(self.link())[1]
+
+    def test_the_measuring_page_is_for_session_holders(self):
+        self.assertEqual(self.request("GET", "/measure")[0], 401)
+        status, _, page = self.request("GET", "/measure", self.session())
+        self.assertEqual(status, 200)
+        self.assertIn(">Measure</button>", page)
+
+    def test_starting_a_measurement_opens_a_flashing_tab_in_the_browser_and_stopping_closes_it(self):
+        cookie = self.session()
+        self.assertEqual(self.request("POST", "/measure/start", cookie)[0], 204)
+        method, path = FakeChrome.calls[-1]
+        target = path.removeprefix("/json/new?")
+        self.assertEqual(method, "PUT")
+        self.assertTrue(target.startswith(f"http://127.0.0.1:{gate.PORT}/measure/target?t="))
+        status, _, page = self.request("GET", target.split(str(gate.PORT), 1)[1])
+        self.assertEqual(status, 200)
+        self.assertIn("addEventListener('mousedown', flip)", page)
+        self.assertEqual(self.request("POST", "/measure/stop", cookie)[0], 204)
+        self.assertEqual(FakeChrome.calls[-1], ("GET", "/json/close/TAB1"))
+
+    def test_the_flashing_tab_is_not_served_to_other_pages(self):
+        self.request("POST", "/measure/start", self.session())
+        self.assertEqual(self.request("GET", "/measure/target?t=guess")[0], 404)
+        self.assertEqual(self.request("GET", "/measure/wait?t=guess&n=0")[0], 404)
+
+    def test_a_flip_reaches_the_waiting_tab(self):
+        cookie = self.session()
+        self.request("POST", "/measure/start", cookie)
+        token = gate.MEASURE["token"]
+        answer = {}
+        waiter = threading.Thread(target=lambda: answer.update(n=json.loads(self.request("GET", f"/measure/wait?t={token}&n=0")[2])["n"]))
+        waiter.start()
+        time.sleep(0.2)
+        self.assertEqual(answer, {})
+        self.assertEqual(self.request("POST", "/measure/flip", cookie)[0], 204)
+        waiter.join(timeout=5)
+        self.assertEqual(answer, {"n": 1})
+
+    def test_flipping_needs_a_session(self):
+        self.assertEqual(self.request("POST", "/measure/flip")[0], 401)
+        self.assertEqual(gate.MEASURE["flips"], 0)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,10 @@ Agents:
   /mcp               Model Context Protocol requests to the bundled MCP server, for one whose key allows "mcp".
   Keys travel in the Authorization header, so they stay out of URLs and logs.
 
+Anyone with a viewer session:
+  GET /measure       measures, from the device that opens it, how long the screen takes to show a change and
+                     how long a press takes to come back. It briefly opens a flashing tab in the browser.
+
 Revoking a principal takes effect at once: its open connections are closed and its sessions stop working.
 The screen server behind this gate has no authentication of its own and is reachable only through it.
 """
@@ -42,6 +46,11 @@ MCP = os.environ.get("GATE_MCP", "localhost:8083")          # the bundled MCP se
 BASE = os.environ.get("GATE_BASE", "").rstrip("/")          # the URL people and agents use to reach this browser
 COOKIE = "shared_browser_" + re.sub(r"[^A-Za-z0-9_]", "_", os.environ.get("GATE_NAME", "browser"))
 SESSION_SECONDS = float(os.environ.get("GATE_SESSION_HOURS", "720")) * 3600
+PORT = int(os.environ.get("GATE_PORT", "8082"))
+
+# The measuring tab: the browser's own page for it waits here for the next flip. token keeps other pages out.
+MEASURE = {"token": None, "tab": None, "flips": 0}
+MEASURE_CHANGED = threading.Condition()
 
 # Open connections through the gate, so a revocation can close them: id -> (still allowed?, sockets).
 ACTIVE = {}
@@ -57,6 +66,141 @@ button{{font:inherit;padding:14px 32px;border:0;border-radius:10px;background:#3
 OPEN = '<form method="post" action="{action}"><button type="submit">Open the browser</button></form>'
 GONE = "<p>This link is no longer valid.</p>"
 NEED_LINK = "<p>Open this browser with a link.</p>"
+
+# Shown inside the shared browser while measuring: black or white, flipped by the gate or by any press on it.
+MEASURE_TARGET = """<!doctype html><html><head><meta charset="utf-8"><title>Measuring</title></head>
+<body style="margin:0;background:#000"><script>
+let white = false;
+const flip = () => { white = !white; document.body.style.background = white ? '#fff' : '#000' };
+addEventListener('mousedown', flip);
+addEventListener('keydown', flip);
+(async () => {
+  let seen = __FLIPS__;
+  for (;;) {
+    try {
+      const now = (await (await fetch('wait?t=__TOKEN__&n=' + seen)).json()).n;
+      if (now !== seen) { seen = now; flip() }
+    } catch (e) { await new Promise(r => setTimeout(r, 500)) }
+  }
+})();
+</script></body></html>"""
+
+MEASURE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Browser</title>
+<style>body{margin:0;font:16px system-ui,sans-serif;background:#f3f4f6;color:#111827}
+main{max-width:640px;margin:0 auto;padding:20px}button{font:inherit;padding:12px 28px;border:0;border-radius:10px;background:#374151;color:#fff}
+button:disabled{opacity:.5}table{width:100%;border-collapse:collapse;margin:16px 0}td{padding:8px 0;border-bottom:1px solid #d1d5db}
+td:last-child{text-align:right;font-variant-numeric:tabular-nums}p{color:#4b5563}iframe{width:100%;aspect-ratio:3/2;border:0;background:#000}
+@media (prefers-color-scheme:dark){body{background:#111827;color:#f3f4f6}p{color:#9ca3af}td{border-color:#374151}button{background:#e5e7eb;color:#111827}}</style>
+</head><body><main>
+<p>Measures, from this device, how long the screen takes to show a change. A flashing tab opens in the browser for about twenty seconds, and control of the screen is taken for a moment.</p>
+<button id="go">Measure</button> <span id="status"></span>
+<table id="out"></table>
+<iframe id="viewer" title="Screen"></iframe>
+</main><script>
+const $ = id => document.getElementById(id);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const median = a => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
+const post = path => fetch(path, {method: 'POST'});
+const canvas = document.createElement('canvas'); canvas.width = canvas.height = 8;
+const ctx = canvas.getContext('2d', {willReadFrequently: true});
+let video, last = null, waiting = null, frames = 0, watching = false;
+
+function white() {
+  const w = video.videoWidth, h = video.videoHeight;
+  ctx.drawImage(video, w / 2 - 40, h / 2 - 40, 80, 80, 0, 0, 8, 8);
+  const d = ctx.getImageData(0, 0, 8, 8).data;
+  let sum = 0;
+  for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
+  return sum / (d.length / 4 * 3) > 127;
+}
+function onFrame() {
+  if (!watching) return;
+  frames++;
+  const now = white();
+  if (last !== null && now !== last && waiting) { const done = waiting; waiting = null; done(performance.now()) }
+  last = now;
+  next();
+}
+function next() { video.requestVideoFrameCallback ? video.requestVideoFrameCallback(onFrame) : requestAnimationFrame(onFrame) }
+function seen(timeout) {
+  return new Promise((resolve, reject) => {
+    waiting = resolve;
+    setTimeout(() => { if (waiting === resolve) { waiting = null; reject(new Error('The change did not reach the screen.')) } }, timeout);
+  });
+}
+async function until(test, ms, message) {
+  for (const end = performance.now() + ms; performance.now() < end; await sleep(100)) { const v = test(); if (v) return v }
+  throw new Error(message);
+}
+async function times(n, act) {
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const t0 = performance.now(), shown = seen(4000);
+    act();
+    out.push(await shown - t0);
+    await sleep(250 + Math.random() * 200);
+  }
+  return out;
+}
+const row = (label, value) => { const tr = $('out').insertRow(); tr.insertCell().textContent = label; tr.insertCell().textContent = value };
+const ms = a => Math.round(median(a)) + ' ms  (' + Math.round(Math.min(...a)) + '–' + Math.round(Math.max(...a)) + ')';
+
+async function measure() {
+  const doc = () => $('viewer').contentDocument;
+  $('status').textContent = 'Connecting to the screen…';
+  $('viewer').src = './';
+  video = await until(() => { const v = doc() && doc().querySelector('video'); return v && v.videoWidth ? v : null }, 30000, 'The screen did not start. If it shows a play button, press it and measure again.');
+  await post('measure/start');
+  await sleep(2000);
+  watching = true; next();
+
+  $('status').textContent = 'Measuring the network…';
+  const trips = [];
+  for (let i = 0; i < 7; i++) { const t0 = performance.now(); await fetch('measure/ping', {cache: 'no-store'}); trips.push(performance.now() - t0); await sleep(100) }
+
+  $('status').textContent = 'Measuring the screen…';
+  const f0 = frames, s0 = performance.now();
+  const screen = await times(10, () => post('measure/flip'));
+  const fps = (frames - f0) / ((performance.now() - s0) / 1000);
+
+  $('status').textContent = 'Measuring a press…';
+  const overlay = doc().querySelector('.overlay');
+  const hosting = () => overlay.style.pointerEvents === 'auto';
+  const control = doc().querySelector('.fa-keyboard.request');
+  const hadControl = hosting();
+  if (!hadControl) control.click();
+  await until(hosting, 5000, 'Control of the screen could not be taken.');
+  const box = overlay.getBoundingClientRect();
+  const at = {clientX: box.left + box.width / 2, clientY: box.top + box.height / 2, button: 0, bubbles: true};
+  const press = await times(10, () => { overlay.dispatchEvent(new MouseEvent('mousedown', at)); overlay.dispatchEvent(new MouseEvent('mouseup', at)) });
+  if (!hadControl) control.click();
+
+  const trip = median(trips);
+  const result = {
+    network_round_trip_ms: Math.round(trip),
+    change_to_seen_ms: Math.round(median(screen) - trip / 2),
+    press_to_seen_ms: Math.round(median(press)),
+    frames_per_second: Math.round(fps),
+    screen: video.videoWidth + 'x' + video.videoHeight,
+    samples: {network: trips.map(Math.round), change: screen.map(Math.round), press: press.map(Math.round)},
+  };
+  row('Network round trip', Math.round(trip) + ' ms');
+  row('A change in the browser, until it is seen here', Math.round(median(screen) - trip / 2) + ' ms');
+  row('A press here, until its result is seen here', ms(press));
+  row('Frames per second', Math.round(fps));
+  row('Screen', result.screen);
+  return result;
+}
+$('go').onclick = async () => {
+  $('go').disabled = true; $('out').textContent = ''; window.result = null;
+  try { window.result = await measure(); $('status').textContent = '' }
+  catch (e) { $('status').textContent = e.message; window.result = {error: e.message} }
+  watching = false; waiting = null; last = null;
+  await post('measure/stop');
+  $('go').disabled = false;
+};
+</script></body></html>"""
 
 
 def digest(secret):
@@ -247,6 +391,8 @@ class Gate(BaseHTTPRequestHandler):
             return self.agent_door("mcp")
         if path.startswith("/go/"):
             return self.use_link() if self.command == "POST" else self.show_link()
+        if path == "/measure" or path.startswith("/measure/"):
+            return self.measure(path)
         if self.command in ("GET", "HEAD"):
             if path == "/_auth":
                 return self.plain(204 if self.viewer()[0] else 401, "")
@@ -297,6 +443,78 @@ class Gate(BaseHTTPRequestHandler):
             return
         path = self.path.split("?", 1)[0] + "?" + urllib.parse.urlencode({"username": name, "password": "-"})
         self.tunnel(SCREEN, path, lambda: session_holder(session_digest) == name)
+
+    # --- measuring ---
+
+    def html(self, text):
+        data = text.encode()
+        self.send_response(200)
+        self.send_header("content-type", "text/html; charset=utf-8")
+        self.send_header("cache-control", "no-store")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(data)
+
+    def chrome(self, method, path):
+        """One request to Chrome's own HTTP endpoint for opening and closing tabs."""
+        host, port = CDP.split(":")
+        conn = http.client.HTTPConnection(host, int(port), timeout=10)
+        conn.request(method, path, headers={"Host": CDP})
+        res = conn.getresponse()
+        text = res.read().decode("utf-8", "replace")
+        return json.loads(text) if text.startswith("{") else None
+
+    def close_measuring_tab(self):
+        if MEASURE["tab"]:
+            try:
+                self.chrome("GET", "/json/close/" + MEASURE["tab"])
+            except (OSError, ValueError):
+                pass
+        MEASURE["tab"] = MEASURE["token"] = None
+
+    def measure(self, path):
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+        # The flashing page and its wait are asked for by the shared browser itself, which has no session:
+        # it carries the token it was opened with instead.
+        if path in ("/measure/target", "/measure/wait"):
+            if not MEASURE["token"] or query.get("t", [""])[0] != MEASURE["token"]:
+                return self.plain(404, "")
+            if path == "/measure/target":
+                return self.html(MEASURE_TARGET.replace("__TOKEN__", MEASURE["token"]).replace("__FLIPS__", str(MEASURE["flips"])))
+            seen = int(query.get("n", ["0"])[0])
+            with MEASURE_CHANGED:
+                MEASURE_CHANGED.wait_for(lambda: MEASURE["flips"] != seen, timeout=25)
+            return self.reply_json({"n": MEASURE["flips"]})
+        if not self.viewer()[0]:
+            return self.page(401, NEED_LINK, head_only=self.command == "HEAD")
+        if path == "/measure" and self.command in ("GET", "HEAD"):
+            return self.html(MEASURE_PAGE)
+        if path == "/measure/ping":
+            return self.plain(204, "")
+        if self.command != "POST":
+            return self.plain(405, "")
+        if path == "/measure/start":
+            self.close_measuring_tab()
+            MEASURE["token"] = secrets.token_urlsafe(16)
+            try:
+                tab = self.chrome("PUT", f"/json/new?http://127.0.0.1:{PORT}/measure/target?t={MEASURE['token']}")
+            except (OSError, ValueError):
+                tab = None
+            if not tab:
+                MEASURE["token"] = None
+                return self.plain(503, "The browser is not ready.")
+            MEASURE["tab"] = tab["id"]
+            return self.plain(204, "")
+        if path == "/measure/flip":
+            with MEASURE_CHANGED:
+                MEASURE["flips"] += 1
+                MEASURE_CHANGED.notify_all()
+            return self.plain(204, "")
+        if path == "/measure/stop":
+            self.close_measuring_tab()
+            return self.plain(204, "")
+        self.plain(404, "")
 
     # --- agents ---
 
@@ -394,4 +612,4 @@ class Gate(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=watch, daemon=True).start()
-    ThreadingHTTPServer(("127.0.0.1", 8082), Gate).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", PORT), Gate).serve_forever()

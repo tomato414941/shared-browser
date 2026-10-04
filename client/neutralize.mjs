@@ -24,6 +24,8 @@ edit("src/components/connect.vue", s => s.replace(/    mounted\(\) \{[\s\S]*?\n 
     }
 `));
 edit("src/components/unsupported.vue", s => s.replace(logoBlock, ""));
+// Leaving is closing the page; a logout that the gate does not know about would only strand the person.
+edit("src/components/settings.vue", s => s.replace(/ *<li v-if="connected">\s*<button @click.stop.prevent="logout">[\s\S]*?<\/li>\n/, ""));
 edit("src/components/header.vue", s => s.replace(/<a href="https:\/\/github.com\/m1k1o\/neko"[\s\S]*?<\/a>/, '<div class="neko"></div>'));
 edit("src/components/about.vue", s => s.replace(/<img src="@\/assets\/images\/logo.svg"[^>]*>\s*<span><b>N<\/b>\.EKO<\/span>/, ""));
 edit("public/site.webmanifest", s => s.replace(/"(name|short_name)": "n\.eko"/g, '"$1": "Browser"'));
