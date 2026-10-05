@@ -1,14 +1,7 @@
-# A neko desktop with a browser exposing CDP. neko only shows the screen and takes input: its server runs unchanged
-# and without authentication, behind the gate. Its client is rebuilt without its name, logo and login form.
+# A browser exposing CDP on a desktop that neko shows and takes input for. neko is used as it ships: unchanged,
+# without authentication, behind the gate, as the part of the viewer under /screen/.
 # Built locally: Chrome is downloaded at build time and not redistributed.
 ARG NEKO_VERSION=3.1.5
-
-FROM node:24-slim AS client
-ARG NEKO_VERSION
-RUN set -eux; apt-get update; apt-get install -y --no-install-recommends git ca-certificates; rm -rf /var/lib/apt/lists/*
-RUN git clone --depth 1 --branch "v${NEKO_VERSION}" https://github.com/m1k1o/neko.git /neko
-COPY client/ /neutral/
-RUN set -eux; cd /neko/client; node /neutral/neutralize.mjs .; npm ci --no-audit --no-fund --loglevel=error; npm run build
 
 FROM node:24-slim AS mcp
 ARG PLAYWRIGHT_MCP_VERSION=0.0.83
@@ -30,10 +23,10 @@ RUN set -eux; \
     fi; \
     apt-get clean; rm -rf /var/lib/apt/lists/*
 
-COPY --from=client /neko/client/dist /var/www
 COPY --from=mcp /usr/local/bin/node /usr/local/bin/node
 COPY --from=mcp /opt/mcp /opt/mcp
 COPY supervisord.conf /etc/neko/supervisord/chrome.conf
+COPY openbox.xml /etc/neko/openbox.xml
 COPY policies.json /etc/opt/chrome/policies/managed/policies.json
 COPY policies.json /etc/chromium/policies/managed/policies.json
 COPY nginx.conf /etc/neko/nginx.conf

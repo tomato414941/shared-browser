@@ -38,7 +38,6 @@ CONTRACT = """What to put in front of an instance:
   People come in with a link from `link`; there is no password. A browser on plain HTTP keeps its session
   too, so a viewer on a LAN works without a front.
   CDP for agents is 127.0.0.1:SB_CDP_PORT, and <SB_VIEWER_URL>/cdp or /mcp with a key from `grant`.
-  <viewer>/measure, opened by someone with a session, measures the screen's delay from the device it is opened on.
   `endpoint <name>` prints all of this for an instance; `config <name>` prints what it will run with."""
 ABILITIES = ("view", "cdp", "mcp")
 
@@ -63,7 +62,8 @@ def usage():
         "                               Print a one-time link that logs a principal in to the viewer; valid 10 minutes.\n"
         "  config <name>                Print the settings the instance runs with, defaults filled in.\n"
         "  ls                           List instances.\n"
-        "Instance keys: SB_WEB_PORT SB_CDP_PORT SB_WEBRTC_PORT SB_WEBRTC_BIND SB_PROFILE_DIR SB_PUBLIC_IP SB_HOME_URL SB_LANG\n"
+        "Instance keys: SB_WEB_PORT SB_CDP_PORT SB_WEBRTC_PORT SB_WEBRTC_BIND SB_PROFILE_DIR SB_STATE_DIR SB_PUBLIC_IP\n"
+        "  SB_HOME_URL SB_LANG\n"
         "  SB_CHROME_FLAGS SB_SCREEN SB_VIDEO_CODEC SB_VIDEO_IDS SB_VIDEO_PIPELINES SB_SESSION_HOURS SB_VIEWER_URL\n"
         "  SB_STUN SB_ICE_SERVERS\n"
         + CONTRACT,
@@ -88,6 +88,7 @@ def read_env(name):
         if line and not line.startswith("#") and "=" in line:
             key, value = line.split("=", 1)
             values[key.strip()] = value.strip()
+    values.setdefault("SB_STATE_DIR", values["SB_PROFILE_DIR"])   # an instance that names no place keeps both together
     return values
 
 
@@ -147,7 +148,8 @@ def settings(name):
 def compose(name, *args, **kwargs):
     # Defaults added after an instance was created still apply: compose reads a merged copy, not the instance file.
     values = settings(name)
-    Path(values["SB_PROFILE_DIR"]).mkdir(parents=True, exist_ok=True, mode=0o700)
+    for key in ("SB_PROFILE_DIR", "SB_STATE_DIR"):
+        Path(values[key]).mkdir(parents=True, exist_ok=True, mode=0o700)
     merged = INSTANCES / f".{name}.compose-env"   # not *.env, so ls and port counting never see it
     fd = os.open(merged, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -171,7 +173,8 @@ def cmd_new(name, overrides):
         "SB_WEB_PORT": next_port(8090, taken),
         "SB_CDP_PORT": next_port(9242, taken),
         "SB_WEBRTC_PORT": next_port(59000, taken),
-        "SB_PROFILE_DIR": Path.home() / ".local/share/shared-browser" / name,
+        "SB_PROFILE_DIR": Path.home() / ".local/share/shared-browser" / name / "profile",
+        "SB_STATE_DIR": Path.home() / ".local/share/shared-browser" / name / "state",
         **DEFAULTS,
     }
     for item in overrides:
@@ -198,7 +201,7 @@ def flags(rest, known):
 @contextmanager
 def grants(name):
     """The instance's principals, locked for update. Keys are kept only as hashes."""
-    path = Path(read_env(name)["SB_PROFILE_DIR"]) / "grants.json"
+    path = Path(read_env(name)["SB_STATE_DIR"]) / "grants.json"
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     with os.fdopen(fd, "r+") as f:
@@ -261,7 +264,7 @@ def cmd_link(name, rest):
             sys.exit(f"{who} may not view. Grant it first: shared-browser grant {name} --as {who} --can view")
         if not grant:
             items[who] = {"can": ["view"], "keys": []}
-    links = Path(values["SB_PROFILE_DIR"]) / "links.json"
+    links = Path(values["SB_STATE_DIR"]) / "links.json"
     links.touch(mode=0o600, exist_ok=True)
     token = secrets.token_urlsafe(24)
     with open(links, "r+") as f:
@@ -285,7 +288,6 @@ def cmd_endpoint(name, as_env):
         "name": name,
         "viewer_url": viewer,
         "viewer_local_url": f"http://127.0.0.1:{values['SB_WEB_PORT']}",
-        "measure_url": f"{viewer}/measure",
         "viewer_url_is_set": bool(values.get("SB_VIEWER_URL")),
         "cdp_url": f"{viewer}/cdp",
         "mcp_url": f"{viewer}/mcp",

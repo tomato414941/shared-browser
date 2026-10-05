@@ -7,14 +7,15 @@ services:
     restart: unless-stopped
     shm_size: 2gb
     cap_add:
-      - SYS_ADMIN
+      - SYS_ADMIN    # lets the browser build its own sandbox
     ports:
       - "127.0.0.1:${SB_WEB_PORT}:8080"      # viewer (put a reverse proxy in front to reach it remotely)
       - "127.0.0.1:${SB_CDP_PORT}:9223"      # CDP, unauthenticated: loopback only
       - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/udp"   # Docker publishes past host firewalls; narrow with SB_WEBRTC_BIND
       - "${SB_WEBRTC_BIND}:${SB_WEBRTC_PORT}:${SB_WEBRTC_PORT}/tcp"
     volumes:
-      - "${SB_PROFILE_DIR}:/home/neko/profile"
+      - "${SB_PROFILE_DIR}:/home/neko/profile"   # the browser's own profile
+      - "${SB_STATE_DIR}:/home/neko/state"       # the gate's: principals, links, sessions
     environment:
       SB_HOME_URL: ${SB_HOME_URL}
       SB_LANG: ${SB_LANG}
@@ -33,5 +34,8 @@ services:
       NEKO_WEBRTC_ICESERVERS_FRONTEND: ${SB_ICE_SERVERS}
       NEKO_WEBRTC_ICESERVERS_BACKEND: ${SB_ICE_SERVERS}
       NEKO_SERVER_PROXY: "true"
-      NEKO_SERVER_BIND: 127.0.0.1:8081    # reachable only through the gate, which nginx fronts on 8080
-      NEKO_MEMBER_PROVIDER: noauth         # who may come in is the gate's business, not neko's
+      # neko is the screen: it lives under /screen/, behind the gate, and decides nothing about who comes in.
+      NEKO_SERVER_BIND: 127.0.0.1:8081
+      NEKO_SERVER_PATH_PREFIX: /screen
+      NEKO_MEMBER_PROVIDER: noauth
+      NEKO_SESSION_IMPLICIT_HOSTING: "true"   # whoever touches the screen has it; there is no button to ask

@@ -4,20 +4,20 @@
 People:
   GET  /go/<token>   shows a button, so link previews in chat apps do not use the link up.
   POST /go/<token>   uses the link and starts a viewer session for its principal, kept as a cookie.
-  Everything the viewer loads is checked against that session (nginx asks /_auth). The screen's WebSocket
-  passes through here, so it can be closed the moment the principal is revoked.
+  GET  /             the page a person uses the browser from. It is this gate's own page; the live screen is one
+                     part of it, loaded from under /screen/.
 
 Agents:
   /cdp/...           the Chrome DevTools Protocol, for a principal whose key allows "cdp".
   /mcp               Model Context Protocol requests to the bundled MCP server, for one whose key allows "mcp".
   Keys travel in the Authorization header, so they stay out of URLs and logs.
 
-Anyone with a viewer session:
-  GET /measure       measures, from the device that opens it, how long the screen takes to show a change and
-                     how long a press takes to come back. It briefly opens a flashing tab in the browser.
+The screen:
+  Whatever shows the browser's screen and takes input lives under /screen/ and has no say in who comes in. Each
+  request to it is checked against the viewer session (nginx asks /_auth), and its live connection passes through
+  here. What this gate knows about the particular screen server is kept in the two functions under "the screen".
 
 Revoking a principal takes effect at once: its open connections are closed and its sessions stop working.
-The screen server behind this gate has no authentication of its own and is reachable only through it.
 """
 import fcntl
 import hashlib
@@ -36,11 +36,11 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-STATE = Path(os.environ.get("GATE_STATE", "/home/neko/profile"))
-LINKS = Path(os.environ.get("GATE_LINKS", STATE / "links.json"))
-GRANTS = Path(os.environ.get("GATE_GRANTS", STATE / "grants.json"))
-SESSIONS = Path(os.environ.get("GATE_SESSIONS", STATE / "sessions.json"))
-SCREEN = os.environ.get("GATE_SCREEN", "127.0.0.1:8081")   # the screen server (neko), with no authentication
+STATE = Path(os.environ.get("GATE_STATE", "/home/neko/state"))
+LINKS = STATE / "links.json"
+GRANTS = STATE / "grants.json"
+SESSIONS = STATE / "sessions.json"
+SCREEN = os.environ.get("GATE_SCREEN", "127.0.0.1:8081")   # the screen server, which has no authentication
 CDP = os.environ.get("GATE_CDP", "127.0.0.1:9222")
 MCP = os.environ.get("GATE_MCP", "localhost:8083")          # the bundled MCP server only answers to this Host
 BASE = os.environ.get("GATE_BASE", "").rstrip("/")          # the URL people and agents use to reach this browser
@@ -48,181 +48,33 @@ COOKIE = "shared_browser_" + re.sub(r"[^A-Za-z0-9_]", "_", os.environ.get("GATE_
 SESSION_SECONDS = float(os.environ.get("GATE_SESSION_HOURS", "720")) * 3600
 PORT = int(os.environ.get("GATE_PORT", "8082"))
 
-# The measuring tab: the browser's own page for it waits here for the next flip. token keeps other pages out.
-MEASURE = {"token": None, "tab": None, "flips": 0}
-MEASURE_CHANGED = threading.Condition()
-
 # Open connections through the gate, so a revocation can close them: id -> (still allowed?, sockets).
 ACTIVE = {}
 ACTIVE_LOCK = threading.Lock()
 
-PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+HEAD = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
 <meta name="referrer" content="no-referrer"><title>Browser</title>
-<style>body{{margin:0;min-height:100vh;display:grid;place-items:center;font:17px system-ui,sans-serif;background:#f3f4f6;color:#111827}}
-button{{font:inherit;padding:14px 32px;border:0;border-radius:10px;background:#374151;color:#fff}}p{{color:#4b5563}}
-@media (prefers-color-scheme:dark){{body{{background:#111827;color:#f3f4f6}}p{{color:#9ca3af}}button{{background:#e5e7eb;color:#111827}}}}</style>
-</head><body>{body}</body></html>"""
-OPEN = '<form method="post" action="{action}"><button type="submit">Open the browser</button></form>'
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='5' width='26' height='22' rx='4' fill='%236b7280'/%3E%3Crect x='6' y='11' width='20' height='13' rx='2' fill='%23f3f4f6'/%3E%3C/svg%3E">"""
+PAGE = HEAD + """
+<style>body{margin:0;min-height:100vh;display:grid;place-items:center;font:17px system-ui,sans-serif;background:#f3f4f6;color:#111827}
+button{font:inherit;padding:14px 32px;border:0;border-radius:10px;background:#374151;color:#fff}p{color:#4b5563}
+@media (prefers-color-scheme:dark){body{background:#111827;color:#f3f4f6}p{color:#9ca3af}button{background:#e5e7eb;color:#111827}}</style>
+</head><body>__BODY__</body></html>"""
+OPEN = '<form method="post" action="__ACTION__"><button type="submit">Open the browser</button></form>'
 GONE = "<p>This link is no longer valid.</p>"
 NEED_LINK = "<p>Open this browser with a link.</p>"
 
-# Shown inside the shared browser while measuring: black or white, flipped by the gate or by any press on it.
-MEASURE_TARGET = """<!doctype html><html><head><meta charset="utf-8"><title>Measuring</title></head>
-<body style="margin:0;background:#000"><script>
-let white = false;
-const flip = () => { white = !white; document.body.style.background = white ? '#fff' : '#000' };
-addEventListener('mousedown', flip);
-addEventListener('keydown', flip);
-(async () => {
-  let seen = __FLIPS__;
-  for (;;) {
-    try {
-      const now = (await (await fetch('wait?t=__TOKEN__&n=' + seen)).json()).n;
-      if (now !== seen) { seen = now; flip() }
-    } catch (e) { await new Promise(r => setTimeout(r, 500)) }
-  }
-})();
-</script></body></html>"""
-
-MEASURE_PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex"><title>Browser</title>
-<style>body{margin:0;font:16px system-ui,sans-serif;background:#f3f4f6;color:#111827}
-main{max-width:640px;margin:0 auto;padding:20px}button{font:inherit;padding:12px 28px;border:0;border-radius:10px;background:#374151;color:#fff}
-button:disabled{opacity:.5}table{width:100%;border-collapse:collapse;margin:16px 0}td{padding:8px 0;border-bottom:1px solid #d1d5db}
-td:last-child{text-align:right;font-variant-numeric:tabular-nums}p{color:#4b5563}iframe{width:100%;aspect-ratio:3/2;border:0;background:#000}
-@media (prefers-color-scheme:dark){body{background:#111827;color:#f3f4f6}p{color:#9ca3af}td{border-color:#374151}button{background:#e5e7eb;color:#111827}}</style>
-</head><body><main>
-<p>Measures, from this device, how long the screen takes to show a change. A flashing tab opens in the browser for about twenty seconds, and control of the screen is taken for a moment.</p>
-<button id="go">Measure</button> <span id="status"></span>
-<table id="out"></table>
-<iframe id="viewer" title="Screen"></iframe>
-</main><script>
-const $ = id => document.getElementById(id);
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const median = a => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
-const post = path => fetch(path, {method: 'POST'});
-const canvas = document.createElement('canvas'); canvas.width = canvas.height = 8;
-const ctx = canvas.getContext('2d', {willReadFrequently: true});
-let video, last = null, waiting = null, frames = 0, watching = false, step = '', wasHidden = false;
-document.addEventListener('visibilitychange', () => { if (document.hidden && watching) wasHidden = true });
-
-function white() {
-  const w = video.videoWidth, h = video.videoHeight;
-  ctx.drawImage(video, w / 2 - 40, h / 2 - 40, 80, 80, 0, 0, 8, 8);
-  const d = ctx.getImageData(0, 0, 8, 8).data;
-  let sum = 0;
-  for (let i = 0; i < d.length; i += 4) sum += d[i] + d[i + 1] + d[i + 2];
-  return sum / (d.length / 4 * 3) > 127;
-}
-function onFrame() {
-  if (!watching) return;
-  frames++;
-  const now = white();
-  if (last !== null && now !== last && waiting) { const done = waiting; waiting = null; done(performance.now()) }
-  last = now;
-  next();
-}
-function next() { video.requestVideoFrameCallback ? video.requestVideoFrameCallback(onFrame) : requestAnimationFrame(onFrame) }
-function seen(timeout) {
-  return new Promise((resolve, reject) => {
-    waiting = resolve;
-    setTimeout(() => { if (waiting === resolve) { waiting = null; reject(new Error('The change did not reach the screen.')) } }, timeout);
-  });
-}
-async function until(test, ms, message) {
-  for (const end = performance.now() + ms; performance.now() < end; await sleep(100)) { const v = test(); if (v) return v }
-  throw new Error(message);
-}
-async function times(n, act) {
-  const out = [];
-  for (let i = 0; i < n; i++) {
-    const t0 = performance.now(), shown = seen(4000);
-    act();
-    out.push(await shown - t0);
-    await sleep(250 + Math.random() * 200);
-  }
-  return out;
-}
-const row = (label, value) => { const tr = $('out').insertRow(); tr.insertCell().textContent = label; tr.insertCell().textContent = value };
-const ms = a => Math.round(median(a)) + ' ms  (' + Math.round(Math.min(...a)) + '–' + Math.round(Math.max(...a)) + ')';
-
-function say(text) { step = text; $('status').textContent = text }
-function state() {
-  return {step, frames, wasHidden, hidden: document.hidden, lastWhite: last,
-          video: video ? {paused: video.paused, readyState: video.readyState, size: video.videoWidth + 'x' + video.videoHeight} : null,
-          frameCallback: !!(video && video.requestVideoFrameCallback), agent: navigator.userAgent};
-}
-function explain(error) {
-  if (wasHidden) return 'This page has to stay in front while it measures. Keep it open and measure again.';
-  if (watching && frames < 3) return 'The screen is not playing on this page. If it shows a play button, press it, then measure again.';
-  return error.message;
-}
-
-async function measure() {
-  const doc = () => $('viewer').contentDocument;
-  frames = 0; wasHidden = false;
-  say('Connecting to the screen…');
-  $('viewer').src = './';
-  video = await until(() => { const v = doc() && doc().querySelector('video'); return v && v.videoWidth ? v : null }, 30000, 'The screen did not start. If it shows a play button, press it and measure again.');
-  await post('measure/start');
-  await sleep(2000);
-  watching = true; next();
-
-  say('Measuring the network…');
-  const trips = [];
-  for (let i = 0; i < 7; i++) { const t0 = performance.now(); await fetch('measure/ping', {cache: 'no-store'}); trips.push(performance.now() - t0); await sleep(100) }
-
-  say('Measuring the screen…');
-  const f0 = frames, s0 = performance.now();
-  const screen = await times(10, () => post('measure/flip'));
-  const fps = (frames - f0) / ((performance.now() - s0) / 1000);
-
-  const trip = median(trips);
-  const result = {
-    network_round_trip_ms: Math.round(trip),
-    change_to_seen_ms: Math.round(median(screen) - trip / 2),
-    press_to_seen_ms: null,
-    frames_per_second: Math.round(fps),
-    screen: video.videoWidth + 'x' + video.videoHeight,
-    samples: {network: trips.map(Math.round), change: screen.map(Math.round)},
-  };
-  row('Network round trip', Math.round(trip) + ' ms');
-  row('A change in the browser, until it is seen here', result.change_to_seen_ms + ' ms');
-
-  say('Measuring a press…');
-  const overlay = doc().querySelector('.overlay');
-  const hosting = () => overlay.style.pointerEvents === 'auto';
-  const control = doc().querySelector('.fa-keyboard.request');
-  const hadControl = hosting();
-  try {
-    if (!hadControl) control.click();
-    await until(hosting, 5000, 'not measured: someone else is controlling the screen');
-    const box = overlay.getBoundingClientRect();
-    const at = {clientX: box.left + box.width / 2, clientY: box.top + box.height / 2, button: 0, bubbles: true};
-    const press = await times(10, () => { overlay.dispatchEvent(new MouseEvent('mousedown', at)); overlay.dispatchEvent(new MouseEvent('mouseup', at)) });
-    result.press_to_seen_ms = Math.round(median(press));
-    result.samples.press = press.map(Math.round);
-    row('A press here, until its result is seen here', ms(press));
-  } catch (e) {
-    result.press_error = e.message;
-    row('A press here, until its result is seen here', e.message.startsWith('not measured') ? e.message : 'not measured');
-  }
-  if (!hadControl && hosting()) control.click();
-  row('Frames per second', result.frames_per_second);
-  row('Screen', result.screen);
-  return result;
-}
-$('go').onclick = async () => {
-  $('go').disabled = true; $('out').textContent = ''; window.result = null;
-  try { window.result = await measure(); $('status').textContent = '' }
-  catch (e) { $('status').textContent = explain(e); window.result = {error: explain(e)} }
-  const report = {...window.result, state: state()};
-  watching = false; waiting = null; last = null;
-  await fetch('measure/report', {method: 'POST', body: JSON.stringify(report)}).catch(() => {});
-  await post('measure/stop');
-  $('go').disabled = false;
-};
+# The page a person uses the browser from. The screen fills it; when the session ends, the page says so.
+VIEWER = HEAD + """
+<style>html,body{margin:0;height:100%;background:#000}iframe{display:block;width:100%;height:100%;border:0}</style>
+</head><body>
+<iframe id="screen" title="Screen" src="__SCREEN__" allow="autoplay; fullscreen; clipboard-read; clipboard-write"></iframe>
+<script>
+setInterval(async () => {
+  const res = await fetch('whoami', {cache: 'no-store'}).catch(() => null);
+  if (res && res.status === 401) location.reload();
+}, 5000);
 </script></body></html>"""
 
 
@@ -250,6 +102,18 @@ def locked(path, default):
         box = [data]
         yield box
         f.seek(0), f.truncate(), json.dump(box[0], f)
+
+
+# --- the screen: all this gate knows about the particular screen server (neko) ---
+
+def screen_page(name):
+    """The address, under /screen/, that shows only the screen and joins it as name without asking anything."""
+    return "screen/?" + urllib.parse.urlencode({"embed": 1, "usr": name, "pwd": "-"})
+
+
+def screen_connection(path, name):
+    """The screen's live connection for name, whatever name the page asked for."""
+    return path + "?" + urllib.parse.urlencode({"username": name, "password": "-"})
 
 
 # --- principals ---
@@ -365,44 +229,27 @@ class Gate(BaseHTTPRequestHandler):
 
     # --- replies ---
 
-    def page(self, status, body, head_only=False):
-        data = PAGE.format(body=body).encode()
-        self.send_response(status)
-        self.send_header("content-type", "text/html; charset=utf-8")
-        self.send_header("cache-control", "no-store")
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        if not head_only:
-            self.wfile.write(data)
-
-    def redirect(self, status=302, cookie=None):
-        self.send_response(status)
-        if cookie:
-            self.send_header("set-cookie", cookie)
-        self.send_header("location", "/")
-        self.send_header("cache-control", "no-store")
-        self.send_header("content-length", "0")
-        self.end_headers()
-
-    def plain(self, status, message, headers=()):
-        data = (message + "\n").encode() if message else b""
+    def send(self, status, content_type, text, headers=()):
+        data = text.encode()
         self.send_response(status)
         for name, value in headers:
             self.send_header(name, value)
-        self.send_header("content-type", "text/plain; charset=utf-8")
+        if content_type:
+            self.send_header("content-type", content_type)
         self.send_header("cache-control", "no-store")
         self.send_header("content-length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
-    def reply_json(self, obj):
-        data = json.dumps(obj).encode()
-        self.send_response(200)
-        self.send_header("content-type", "application/json")
-        self.send_header("cache-control", "no-store")
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    def page(self, status, body):
+        self.send(status, "text/html; charset=utf-8", PAGE.replace("__BODY__", body))
+
+    def plain(self, status, message, headers=()):
+        self.send(status, "text/plain; charset=utf-8", message + "\n" if message else "", headers)
+
+    def redirect(self, status=302, cookie=None):
+        self.send(status, None, "", [("location", "/")] + ([("set-cookie", cookie)] if cookie else []))
 
     # --- routing ---
 
@@ -414,17 +261,17 @@ class Gate(BaseHTTPRequestHandler):
             return self.agent_door("mcp")
         if path.startswith("/go/"):
             return self.use_link() if self.command == "POST" else self.show_link()
-        if path == "/measure" or path.startswith("/measure/"):
-            return self.measure(path)
+        name = self.viewer()[0]
         if self.command in ("GET", "HEAD"):
             if path == "/_auth":
-                return self.plain(204 if self.viewer()[0] else 401, "")
-            if path == "/whoami":
-                name = self.viewer()[0]
-                return self.reply_json({"name": name}) if name else self.plain(401, "A link is needed.")
-            if self.headers.get("Upgrade", "").lower() == "websocket":
+                return self.plain(204 if name else 401, "")
+            if path == "/whoami" and name:
+                return self.send(200, "application/json", json.dumps({"name": name}))
+            if path.startswith("/screen/") and self.headers.get("Upgrade", "").lower() == "websocket":
                 return self.screen_socket()
-        self.page(401, NEED_LINK, head_only=self.command == "HEAD")
+            if path == "/" and name:
+                return self.send(200, "text/html; charset=utf-8", VIEWER.replace("__SCREEN__", html.escape(screen_page(name))))
+        self.page(401, NEED_LINK)
 
     do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = route
 
@@ -435,13 +282,12 @@ class Gate(BaseHTTPRequestHandler):
         return token if token and "/" not in token else None
 
     def show_link(self):
-        head_only = self.command == "HEAD"
         if self.viewer()[0]:
             self.redirect()
         elif self.link_token() and link_usable(self.link_token()):
-            self.page(200, OPEN.format(action=html.escape(self.path.split("?", 1)[0])), head_only)
+            self.page(200, OPEN.replace("__ACTION__", html.escape(self.path.split("?", 1)[0])))
         else:
-            self.page(404, GONE, head_only)
+            self.page(404, GONE)
 
     def use_link(self):
         if self.viewer()[0]:
@@ -464,85 +310,8 @@ class Gate(BaseHTTPRequestHandler):
         if not self.same_origin():
             self.plain(403, "This connection must come from the browser's own page.")
             return
-        path = self.path.split("?", 1)[0] + "?" + urllib.parse.urlencode({"username": name, "password": "-"})
+        path = screen_connection(self.path.split("?", 1)[0], name)
         self.tunnel(SCREEN, path, lambda: session_holder(session_digest) == name)
-
-    # --- measuring ---
-
-    def html(self, text):
-        data = text.encode()
-        self.send_response(200)
-        self.send_header("content-type", "text/html; charset=utf-8")
-        self.send_header("cache-control", "no-store")
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(data)
-
-    def chrome(self, method, path):
-        """One request to Chrome's own HTTP endpoint for opening and closing tabs."""
-        host, port = CDP.split(":")
-        conn = http.client.HTTPConnection(host, int(port), timeout=10)
-        conn.request(method, path, headers={"Host": CDP})
-        res = conn.getresponse()
-        text = res.read().decode("utf-8", "replace")
-        return json.loads(text) if text.startswith("{") else None
-
-    def close_measuring_tab(self):
-        if MEASURE["tab"]:
-            try:
-                self.chrome("GET", "/json/close/" + MEASURE["tab"])
-            except (OSError, ValueError):
-                pass
-        MEASURE["tab"] = MEASURE["token"] = None
-
-    def measure(self, path):
-        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
-        # The flashing page and its wait are asked for by the shared browser itself, which has no session:
-        # it carries the token it was opened with instead.
-        if path in ("/measure/target", "/measure/wait"):
-            if not MEASURE["token"] or query.get("t", [""])[0] != MEASURE["token"]:
-                return self.plain(404, "")
-            if path == "/measure/target":
-                return self.html(MEASURE_TARGET.replace("__TOKEN__", MEASURE["token"]).replace("__FLIPS__", str(MEASURE["flips"])))
-            seen = int(query.get("n", ["0"])[0])
-            with MEASURE_CHANGED:
-                MEASURE_CHANGED.wait_for(lambda: MEASURE["flips"] != seen, timeout=25)
-            return self.reply_json({"n": MEASURE["flips"]})
-        if not self.viewer()[0]:
-            return self.page(401, NEED_LINK, head_only=self.command == "HEAD")
-        if path == "/measure" and self.command in ("GET", "HEAD"):
-            return self.html(MEASURE_PAGE)
-        if path == "/measure/ping":
-            return self.plain(204, "")
-        if self.command != "POST":
-            return self.plain(405, "")
-        if path == "/measure/start":
-            self.close_measuring_tab()
-            MEASURE["token"] = secrets.token_urlsafe(16)
-            try:
-                tab = self.chrome("PUT", f"/json/new?http://127.0.0.1:{PORT}/measure/target?t={MEASURE['token']}")
-            except (OSError, ValueError):
-                tab = None
-            if not tab:
-                MEASURE["token"] = None
-                return self.plain(503, "The browser is not ready.")
-            MEASURE["tab"] = tab["id"]
-            return self.plain(204, "")
-        if path == "/measure/flip":
-            with MEASURE_CHANGED:
-                MEASURE["flips"] += 1
-                MEASURE_CHANGED.notify_all()
-            return self.plain(204, "")
-        if path == "/measure/stop":
-            self.close_measuring_tab()
-            return self.plain(204, "")
-        if path == "/measure/report":
-            # What the measuring page found, or where it stopped, kept in the gate's log.
-            body = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 8192)).decode("utf-8", "replace")
-            print(f"measure by {self.viewer()[0]}: {body}", flush=True)
-            return self.plain(204, "")
-        self.plain(404, "")
 
     # --- agents ---
 
@@ -581,12 +350,7 @@ class Gate(BaseHTTPRequestHandler):
             self.plain(503, "The browser is not ready.")
             return
         body = body.replace(f"ws://{CDP}", self.outside()).replace(f"ws={CDP}", "ws=" + self.outside().split("://", 1)[1])
-        data = body.encode()
-        self.send_response(res.status)
-        self.send_header("content-type", res.getheader("content-type", "application/json"))
-        self.send_header("content-length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        self.send(res.status, res.getheader("content-type", "application/json"), body)
 
     # --- carrying a connection ---
 

@@ -17,7 +17,9 @@ class CliTests(unittest.TestCase):
         self.root = Path(tmp.name)
         shutil.copy(CLI, self.root / "shared-browser")
         self.profile = self.root / "profile"
-        self.run_cli("new", "b", f"SB_PROFILE_DIR={self.profile}", "SB_VIEWER_URL=https://browser.example")
+        self.state = self.root / "state"
+        self.run_cli("new", "b", f"SB_PROFILE_DIR={self.profile}", f"SB_STATE_DIR={self.state}",
+                     "SB_VIEWER_URL=https://browser.example")
 
     def run_cli(self, *args, ok=True):
         res = subprocess.run([str(self.root / "shared-browser"), *args], capture_output=True, text=True)
@@ -26,7 +28,7 @@ class CliTests(unittest.TestCase):
         return res
 
     def grants(self):
-        return json.loads((self.profile / "grants.json").read_text())
+        return json.loads((self.state / "grants.json").read_text())
 
     def test_granting_cdp_prints_a_key_once_and_keeps_only_its_hash(self):
         out = json.loads(self.run_cli("grant", "b", "--as", "claude", "--can", "cdp").stdout)
@@ -34,8 +36,8 @@ class CliTests(unittest.TestCase):
         stored = self.grants()["claude"]
         self.assertEqual(stored["can"], ["cdp"])
         self.assertEqual(stored["keys"][0]["hash"], hashlib.sha256(out["key"].encode()).hexdigest())
-        self.assertNotIn(out["key"], (self.profile / "grants.json").read_text())
-        self.assertEqual((self.profile / "grants.json").stat().st_mode & 0o777, 0o600)
+        self.assertNotIn(out["key"], (self.state / "grants.json").read_text())
+        self.assertEqual((self.state / "grants.json").stat().st_mode & 0o777, 0o600)
 
     def test_granting_only_view_issues_no_key(self):
         out = json.loads(self.run_cli("grant", "b", "--as", "tomato", "--can", "view").stdout)
@@ -88,6 +90,17 @@ class CliTests(unittest.TestCase):
         self.assertTrue(out["viewer_local_url"].startswith("http://127.0.0.1:"))
         self.assertEqual(out["webrtc_bind"], "0.0.0.0")
         self.assertIsNone(out["public_ip"])
+
+    def test_a_new_instance_keeps_the_gates_state_apart_from_the_browsers_profile(self):
+        self.run_cli("new", "g")
+        conf = self.config("g")
+        self.assertTrue(conf["SB_PROFILE_DIR"].endswith("/g/profile"))
+        self.assertTrue(conf["SB_STATE_DIR"].endswith("/g/state"))
+
+    def test_an_instance_that_names_no_state_place_keeps_it_with_the_profile(self):
+        env = self.root / "instances" / "b.env"
+        env.write_text("".join(l for l in env.read_text().splitlines(True) if not l.startswith("SB_STATE_DIR=")))
+        self.assertEqual(self.config("b")["SB_STATE_DIR"], str(self.profile))
 
     def test_unknown_abilities_are_refused(self):
         self.assertNotEqual(self.run_cli("grant", "b", "--as", "x", "--can", "root", ok=False).returncode, 0)

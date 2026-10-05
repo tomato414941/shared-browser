@@ -37,27 +37,9 @@ class FakeScreen(BaseHTTPRequestHandler):
         pass
 
 
-class FakeChrome(BaseHTTPRequestHandler):
-    """Chrome's HTTP endpoint for tabs: opens one for PUT /json/new?<url>, closes one for /json/close/<id>."""
-    calls = []
-
-    def answer(self):
-        FakeChrome.calls.append((self.command, self.path))
-        body = json.dumps({"id": "TAB1"}).encode() if self.path.startswith("/json/new") else b"Target is closing"
-        self.send_response(200)
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    do_GET = do_PUT = answer
-
-    def log_message(self, *_):
-        pass
-
-
 class GateTests(unittest.TestCase):
     def setUp(self):
-        FakeScreen.seen, FakeChrome.calls = [], []
+        FakeScreen.seen = []
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.links = Path(tmp.name) / "links.json"
@@ -65,9 +47,7 @@ class GateTests(unittest.TestCase):
         self.grants.write_text(json.dumps({"tomato": {"can": ["view"], "keys": []}}))
         screen = self.serve(FakeScreen)
         settings = patch.multiple(gate, LINKS=self.links, GRANTS=self.grants, SESSIONS=Path(tmp.name) / "sessions.json",
-                                  SCREEN=f"127.0.0.1:{screen.server_port}", BASE="",
-                                  CDP=f"127.0.0.1:{self.serve(FakeChrome).server_port}",
-                                  MEASURE={"token": None, "tab": None, "flips": 0})
+                                  SCREEN=f"127.0.0.1:{screen.server_port}", BASE="")
         settings.start()
         self.addCleanup(settings.stop)
         gate.Gate.log_message = lambda *_: None
@@ -105,7 +85,7 @@ class GateTests(unittest.TestCase):
 
     def open_screen(self, cookie, origin=None):
         sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
-        sock.sendall((f"GET /ws?username=someone-else&password=guess HTTP/1.1\r\nHost: {self.host}\r\n"
+        sock.sendall((f"GET /screen/ws?username=someone-else&password=guess HTTP/1.1\r\nHost: {self.host}\r\n"
                       f"Origin: {origin or 'http://' + self.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
                       f"Cookie: {cookie}\r\n\r\n").encode())
         reply = b""
@@ -168,9 +148,18 @@ class GateTests(unittest.TestCase):
 
     def test_without_a_session_the_viewer_asks_for_a_link(self):
         self.assertEqual(self.request("GET", "/_auth")[0], 401)
-        status, _, page = self.request("GET", "/")
-        self.assertEqual(status, 401)
-        self.assertIn("Open this browser with a link.", page)
+        self.assertEqual(self.request("GET", "/whoami")[0], 401)
+        for path in ("/", "/screen/", "/anything"):
+            status, _, page = self.request("GET", path)
+            self.assertEqual(status, 401)
+            self.assertIn("Open this browser with a link.", page)
+
+    def test_the_viewer_is_the_gates_own_page_with_the_screen_as_one_part(self):
+        _, cookie, _ = self.press(self.link())
+        status, _, page = self.request("GET", "/", cookie)
+        self.assertEqual(status, 200)
+        self.assertIn("<title>Browser</title>", page)
+        self.assertIn('<iframe id="screen" title="Screen" src="screen/?embed=1&amp;usr=tomato&amp;pwd=-"', page)
 
     def test_a_made_up_cookie_is_not_a_session(self):
         self.assertEqual(self.request("GET", "/_auth", f"{COOKIE}=guess")[0], 401)
@@ -196,7 +185,7 @@ class GateTests(unittest.TestCase):
         sock.sendall(b"frame")
         self.assertEqual(sock.recv(1024), b"frame")
         path, passed_cookie, _ = FakeScreen.seen[-1]
-        self.assertEqual(path, "/ws?username=tomato&password=-")
+        self.assertEqual(path, "/screen/ws?username=tomato&password=-")
         self.assertIsNone(passed_cookie)
 
     def test_the_screen_refuses_a_connection_without_a_session(self):
@@ -216,60 +205,6 @@ class GateTests(unittest.TestCase):
         self.revoke("tomato")
         gate.enforce()
         self.assertEqual(sock.recv(1024), b"")
-
-    # --- measuring ---
-
-    def session(self):
-        return self.press(self.link())[1]
-
-    def test_the_measuring_page_is_for_session_holders(self):
-        self.assertEqual(self.request("GET", "/measure")[0], 401)
-        status, _, page = self.request("GET", "/measure", self.session())
-        self.assertEqual(status, 200)
-        self.assertIn(">Measure</button>", page)
-
-    def test_starting_a_measurement_opens_a_flashing_tab_in_the_browser_and_stopping_closes_it(self):
-        cookie = self.session()
-        self.assertEqual(self.request("POST", "/measure/start", cookie)[0], 204)
-        method, path = FakeChrome.calls[-1]
-        target = path.removeprefix("/json/new?")
-        self.assertEqual(method, "PUT")
-        self.assertTrue(target.startswith(f"http://127.0.0.1:{gate.PORT}/measure/target?t="))
-        status, _, page = self.request("GET", target.split(str(gate.PORT), 1)[1])
-        self.assertEqual(status, 200)
-        self.assertIn("addEventListener('mousedown', flip)", page)
-        self.assertEqual(self.request("POST", "/measure/stop", cookie)[0], 204)
-        self.assertEqual(FakeChrome.calls[-1], ("GET", "/json/close/TAB1"))
-
-    def test_the_flashing_tab_is_not_served_to_other_pages(self):
-        self.request("POST", "/measure/start", self.session())
-        self.assertEqual(self.request("GET", "/measure/target?t=guess")[0], 404)
-        self.assertEqual(self.request("GET", "/measure/wait?t=guess&n=0")[0], 404)
-
-    def test_a_flip_reaches_the_waiting_tab(self):
-        cookie = self.session()
-        self.request("POST", "/measure/start", cookie)
-        token = gate.MEASURE["token"]
-        answer = {}
-        waiter = threading.Thread(target=lambda: answer.update(n=json.loads(self.request("GET", f"/measure/wait?t={token}&n=0")[2])["n"]))
-        waiter.start()
-        time.sleep(0.2)
-        self.assertEqual(answer, {})
-        self.assertEqual(self.request("POST", "/measure/flip", cookie)[0], 204)
-        waiter.join(timeout=5)
-        self.assertEqual(answer, {"n": 1})
-
-    def test_a_measurement_report_is_kept_in_the_gates_log(self):
-        cookie = self.session()
-        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        with patch("builtins.print") as log:
-            conn.request("POST", "/measure/report", body=json.dumps({"error": "x"}), headers={"Cookie": cookie})
-            self.assertEqual(conn.getresponse().status, 204)
-        self.assertEqual(log.call_args.args[0], 'measure by tomato: {"error": "x"}')
-
-    def test_flipping_needs_a_session(self):
-        self.assertEqual(self.request("POST", "/measure/flip")[0], 401)
-        self.assertEqual(gate.MEASURE["flips"], 0)
 
 
 if __name__ == "__main__":
