@@ -259,6 +259,14 @@ class GateTests(unittest.TestCase):
         waiter.join(timeout=5)
         self.assertEqual(answer, {"n": 1})
 
+    def test_a_measurement_report_is_kept_in_the_gates_log(self):
+        cookie = self.session()
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        with patch("builtins.print") as log:
+            conn.request("POST", "/measure/report", body=json.dumps({"error": "x"}), headers={"Cookie": cookie})
+            self.assertEqual(conn.getresponse().status, 204)
+        self.assertEqual(log.call_args.args[0], 'measure by tomato: {"error": "x"}')
+
     def test_flipping_needs_a_session(self):
         self.assertEqual(self.request("POST", "/measure/flip")[0], 401)
         self.assertEqual(gate.MEASURE["flips"], 0)

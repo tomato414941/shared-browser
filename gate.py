@@ -104,7 +104,8 @@ const median = a => [...a].sort((x, y) => x - y)[Math.floor(a.length / 2)];
 const post = path => fetch(path, {method: 'POST'});
 const canvas = document.createElement('canvas'); canvas.width = canvas.height = 8;
 const ctx = canvas.getContext('2d', {willReadFrequently: true});
-let video, last = null, waiting = null, frames = 0, watching = false;
+let video, last = null, waiting = null, frames = 0, watching = false, step = '', wasHidden = false;
+document.addEventListener('visibilitychange', () => { if (document.hidden && watching) wasHidden = true });
 
 function white() {
   const w = video.videoWidth, h = video.videoHeight;
@@ -146,57 +147,79 @@ async function times(n, act) {
 const row = (label, value) => { const tr = $('out').insertRow(); tr.insertCell().textContent = label; tr.insertCell().textContent = value };
 const ms = a => Math.round(median(a)) + ' ms  (' + Math.round(Math.min(...a)) + '–' + Math.round(Math.max(...a)) + ')';
 
+function say(text) { step = text; $('status').textContent = text }
+function state() {
+  return {step, frames, wasHidden, hidden: document.hidden, lastWhite: last,
+          video: video ? {paused: video.paused, readyState: video.readyState, size: video.videoWidth + 'x' + video.videoHeight} : null,
+          frameCallback: !!(video && video.requestVideoFrameCallback), agent: navigator.userAgent};
+}
+function explain(error) {
+  if (wasHidden) return 'This page has to stay in front while it measures. Keep it open and measure again.';
+  if (watching && frames < 3) return 'The screen is not playing on this page. If it shows a play button, press it, then measure again.';
+  return error.message;
+}
+
 async function measure() {
   const doc = () => $('viewer').contentDocument;
-  $('status').textContent = 'Connecting to the screen…';
+  frames = 0; wasHidden = false;
+  say('Connecting to the screen…');
   $('viewer').src = './';
   video = await until(() => { const v = doc() && doc().querySelector('video'); return v && v.videoWidth ? v : null }, 30000, 'The screen did not start. If it shows a play button, press it and measure again.');
   await post('measure/start');
   await sleep(2000);
   watching = true; next();
 
-  $('status').textContent = 'Measuring the network…';
+  say('Measuring the network…');
   const trips = [];
   for (let i = 0; i < 7; i++) { const t0 = performance.now(); await fetch('measure/ping', {cache: 'no-store'}); trips.push(performance.now() - t0); await sleep(100) }
 
-  $('status').textContent = 'Measuring the screen…';
+  say('Measuring the screen…');
   const f0 = frames, s0 = performance.now();
   const screen = await times(10, () => post('measure/flip'));
   const fps = (frames - f0) / ((performance.now() - s0) / 1000);
-
-  $('status').textContent = 'Measuring a press…';
-  const overlay = doc().querySelector('.overlay');
-  const hosting = () => overlay.style.pointerEvents === 'auto';
-  const control = doc().querySelector('.fa-keyboard.request');
-  const hadControl = hosting();
-  if (!hadControl) control.click();
-  await until(hosting, 5000, 'Control of the screen could not be taken.');
-  const box = overlay.getBoundingClientRect();
-  const at = {clientX: box.left + box.width / 2, clientY: box.top + box.height / 2, button: 0, bubbles: true};
-  const press = await times(10, () => { overlay.dispatchEvent(new MouseEvent('mousedown', at)); overlay.dispatchEvent(new MouseEvent('mouseup', at)) });
-  if (!hadControl) control.click();
 
   const trip = median(trips);
   const result = {
     network_round_trip_ms: Math.round(trip),
     change_to_seen_ms: Math.round(median(screen) - trip / 2),
-    press_to_seen_ms: Math.round(median(press)),
+    press_to_seen_ms: null,
     frames_per_second: Math.round(fps),
     screen: video.videoWidth + 'x' + video.videoHeight,
-    samples: {network: trips.map(Math.round), change: screen.map(Math.round), press: press.map(Math.round)},
+    samples: {network: trips.map(Math.round), change: screen.map(Math.round)},
   };
   row('Network round trip', Math.round(trip) + ' ms');
-  row('A change in the browser, until it is seen here', Math.round(median(screen) - trip / 2) + ' ms');
-  row('A press here, until its result is seen here', ms(press));
-  row('Frames per second', Math.round(fps));
+  row('A change in the browser, until it is seen here', result.change_to_seen_ms + ' ms');
+
+  say('Measuring a press…');
+  const overlay = doc().querySelector('.overlay');
+  const hosting = () => overlay.style.pointerEvents === 'auto';
+  const control = doc().querySelector('.fa-keyboard.request');
+  const hadControl = hosting();
+  try {
+    if (!hadControl) control.click();
+    await until(hosting, 5000, 'not measured: someone else is controlling the screen');
+    const box = overlay.getBoundingClientRect();
+    const at = {clientX: box.left + box.width / 2, clientY: box.top + box.height / 2, button: 0, bubbles: true};
+    const press = await times(10, () => { overlay.dispatchEvent(new MouseEvent('mousedown', at)); overlay.dispatchEvent(new MouseEvent('mouseup', at)) });
+    result.press_to_seen_ms = Math.round(median(press));
+    result.samples.press = press.map(Math.round);
+    row('A press here, until its result is seen here', ms(press));
+  } catch (e) {
+    result.press_error = e.message;
+    row('A press here, until its result is seen here', e.message.startsWith('not measured') ? e.message : 'not measured');
+  }
+  if (!hadControl && hosting()) control.click();
+  row('Frames per second', result.frames_per_second);
   row('Screen', result.screen);
   return result;
 }
 $('go').onclick = async () => {
   $('go').disabled = true; $('out').textContent = ''; window.result = null;
   try { window.result = await measure(); $('status').textContent = '' }
-  catch (e) { $('status').textContent = e.message; window.result = {error: e.message} }
+  catch (e) { $('status').textContent = explain(e); window.result = {error: explain(e)} }
+  const report = {...window.result, state: state()};
   watching = false; waiting = null; last = null;
+  await fetch('measure/report', {method: 'POST', body: JSON.stringify(report)}).catch(() => {});
   await post('measure/stop');
   $('go').disabled = false;
 };
@@ -513,6 +536,11 @@ class Gate(BaseHTTPRequestHandler):
             return self.plain(204, "")
         if path == "/measure/stop":
             self.close_measuring_tab()
+            return self.plain(204, "")
+        if path == "/measure/report":
+            # What the measuring page found, or where it stopped, kept in the gate's log.
+            body = self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 8192)).decode("utf-8", "replace")
+            print(f"measure by {self.viewer()[0]}: {body}", flush=True)
             return self.plain(204, "")
         self.plain(404, "")
 
