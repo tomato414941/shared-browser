@@ -10,6 +10,8 @@ People:
 Agents:
   /cdp/...           the Chrome DevTools Protocol, for a principal whose key allows "cdp".
   /mcp               Model Context Protocol requests to the bundled MCP server, for one whose key allows "mcp".
+  POST /link         {"as": <principal>} gives a one-time link for that principal to come to the screen. This is how
+                     an agent brings a person in when it needs them; what for, it says itself when it passes the link.
   Keys travel in the Authorization header, so they stay out of URLs and logs.
 
 The screen:
@@ -142,6 +144,15 @@ def key_holder(key_digest):
 
 # --- links ---
 
+def new_link(name, minutes=10):
+    token = secrets.token_urlsafe(24)
+    with locked(LINKS, []) as box:
+        now = time.time()
+        box[0] = [l for l in box[0] if l["expires"] > now]
+        box[0].append({"token": token, "expires": now + minutes * 60, "as": name})
+    return token
+
+
 def link_usable(token):
     return any(l["token"] == token and not l.get("used") and l["expires"] > time.time() for l in read(LINKS, []))
 
@@ -261,6 +272,8 @@ class Gate(BaseHTTPRequestHandler):
             return self.agent_door("mcp")
         if path.startswith("/go/"):
             return self.use_link() if self.command == "POST" else self.show_link()
+        if path == "/link" and self.command == "POST":
+            return self.make_link()
         name = self.viewer()[0]
         if self.command in ("GET", "HEAD"):
             if path == "/_auth":
@@ -314,6 +327,24 @@ class Gate(BaseHTTPRequestHandler):
         self.tunnel(SCREEN, path, lambda: session_holder(session_digest) == name)
 
     # --- agents ---
+
+    def make_link(self):
+        """A link for a person, made by an agent that holds a key. Only for principals who may already view."""
+        name = self.key()[0]
+        if not name:
+            self.plain(401, "A key is required.", [("www-authenticate", 'Bearer realm="shared-browser"')])
+            return
+        try:
+            body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 4096)) or b"{}")
+            who = body["as"]
+        except (ValueError, KeyError, TypeError):
+            self.plain(400, 'Say who the link is for: {"as": "<principal>"}.')
+            return
+        if not isinstance(who, str) or not may(who, "view"):
+            self.plain(404, f"No principal '{who}' may view this browser.")
+            return
+        base = BASE or f"{'https' if self.https() else 'http'}://{self.headers.get('Host', '')}"
+        self.send(200, "application/json", json.dumps({"as": who, "link": f"{base}/go/{new_link(who)}", "minutes": 10}))
 
     def agent_door(self, ability):
         name, key_digest = self.key()

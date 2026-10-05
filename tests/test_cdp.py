@@ -97,7 +97,8 @@ class CdpTests(unittest.TestCase):
         mcp.expected_host = f"localhost:{mcp.server_port}"
         chrome = serve(self, FakeChrome)
         self.chrome = f"127.0.0.1:{chrome.server_port}"
-        settings = patch.multiple(gate, GRANTS=self.grants, CDP=self.chrome, BASE="https://browser.example",
+        self.links = Path(tmp.name) / "links.json"
+        settings = patch.multiple(gate, GRANTS=self.grants, LINKS=self.links, CDP=self.chrome, BASE="https://browser.example",
                                   MCP=mcp.expected_host)
         settings.start()
         self.addCleanup(settings.stop)
@@ -194,6 +195,30 @@ class CdpTests(unittest.TestCase):
         sock.settimeout(5)
         self.assertEqual(sock.recv(1024), b"still")
         sock.close()
+
+    def post_link(self, key, body):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.gate.server_port}/link", data=json.dumps(body).encode(),
+                                     method="POST", headers={"Authorization": f"Bearer {key}"} if key else {})
+        try:
+            with urllib.request.urlopen(req) as res:
+                return res.status, json.load(res)
+        except urllib.error.HTTPError as error:
+            return error.code, None
+
+    def test_an_agent_with_a_key_can_bring_a_person_in_with_a_link(self):
+        status, out = self.post_link("good-key", {"as": "tomato"})
+        self.assertEqual(status, 200)
+        self.assertTrue(out["link"].startswith("https://browser.example/go/"))
+        token = out["link"].rsplit("/", 1)[1]
+        self.assertTrue(gate.link_usable(token))
+        self.assertEqual(json.loads(gate.LINKS.read_text())[-1]["as"], "tomato")
+
+    def test_a_link_is_only_for_someone_who_may_already_view(self):
+        self.assertEqual(self.post_link("good-key", {"as": "nobody"})[0], 404)
+        self.assertEqual(self.post_link("good-key", {"as": "claude"})[0], 404)
+        self.assertEqual(self.post_link("good-key", {})[0], 400)
+        self.assertEqual(self.post_link(None, {"as": "tomato"})[0], 401)
+        self.assertFalse(gate.LINKS.exists())
 
     def test_websocket_is_carried_both_ways_without_the_key(self):
         with socket.create_connection(("127.0.0.1", self.gate.server_port), timeout=5) as sock:
