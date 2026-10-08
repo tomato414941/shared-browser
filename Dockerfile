@@ -31,3 +31,6 @@ COPY policies.json /etc/opt/chrome/policies/managed/policies.json
 COPY policies.json /etc/chromium/policies/managed/policies.json
 COPY nginx.conf /etc/neko/nginx.conf
 COPY gate.py /usr/local/bin/gate.py
+
+# Healthy while every part supervisord runs is running. A part it could not start again stays down and shows here.
+HEALTHCHECK --interval=10s --timeout=5s CMD supervisorctl -c /etc/neko/supervisord.conf status > /dev/null || exit 1
