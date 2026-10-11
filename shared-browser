@@ -21,20 +21,19 @@ DEFAULTS = {
     "SB_SCREEN": "1440x960@30",
     "SB_PUBLIC_IP": "",               # the address WebRTC clients reach; empty lets STUN discover it
     "SB_STUN": "stun:stun.l.google.com:19302",
+    "SB_ICE_SERVERS": "",             # JSON list like RTCPeerConnection's iceServers, for TURN
     "SB_SESSION_HOURS": "720",
     "SB_WEBRTC_BIND": "0.0.0.0",
-    "SB_VIDEO_CODEC": "vp8",
-    "SB_VIDEO_IDS": "main",
-    "SB_VIDEO_PIPELINES": "{}",
     "SB_VIEWER_URL": "",              # how people and agents reach the viewer from outside, if a front is set up
 }
+WATCHERS = 4   # people who can watch a new instance at once: one WebRTC port each
 CONTRACT = """What to put in front of an instance:
   The viewer listens on 127.0.0.1:SB_WEB_PORT over plain HTTP. To reach it from elsewhere, put any HTTPS front
   in front of that port (a tunnel, a reverse proxy) and set SB_VIEWER_URL to the address it answers at.
-  WebRTC (the live screen) uses SB_WEBRTC_PORT over UDP and TCP, published on SB_WEBRTC_BIND (all addresses
-  unless set). Clients must reach that port directly; it does not pass through an HTTP front. Set SB_PUBLIC_IP
-  to the address they reach it at, or leave it empty to let STUN (SB_STUN) discover it. Behind a NAT that
-  blocks this, run a TURN server and pass it in SB_ICE_SERVERS as JSON.
+  WebRTC (the live screen) uses the UDP ports in SB_WEBRTC_PORT (FIRST-LAST, one for each person watching at
+  once), published on SB_WEBRTC_BIND (all addresses unless set). Clients must reach them directly; they do not
+  pass through an HTTP front. Set SB_PUBLIC_IP to the address they reach them at, or leave it empty to let STUN
+  (SB_STUN) discover it. Behind a NAT that blocks this, run a TURN server and pass it in SB_ICE_SERVERS as JSON.
   People come in with a link from `link`; there is no password. A browser on plain HTTP keeps its session
   too, so a viewer on a LAN works without a front.
   CDP for agents is 127.0.0.1:SB_CDP_PORT, and <SB_VIEWER_URL>/cdp or /mcp with a key from `grant`. An agent that
@@ -64,9 +63,7 @@ def usage():
         "  config <name>                Print the settings the instance runs with, defaults filled in.\n"
         "  ls                           List instances.\n"
         "Instance keys: SB_WEB_PORT SB_CDP_PORT SB_WEBRTC_PORT SB_WEBRTC_BIND SB_PROFILE_DIR SB_STATE_DIR SB_PUBLIC_IP\n"
-        "  SB_HOME_URL SB_LANG\n"
-        "  SB_CHROME_FLAGS SB_SCREEN SB_VIDEO_CODEC SB_VIDEO_IDS SB_VIDEO_PIPELINES SB_SESSION_HOURS SB_VIEWER_URL\n"
-        "  SB_STUN SB_ICE_SERVERS\n"
+        "  SB_HOME_URL SB_LANG SB_CHROME_FLAGS SB_SCREEN SB_SESSION_HOURS SB_VIEWER_URL SB_STUN SB_ICE_SERVERS\n"
         + CONTRACT,
         file=sys.stderr,
     )
@@ -120,30 +117,23 @@ def used_ports():
         for path in INSTANCES.glob("*.env"):
             for line in path.read_text().splitlines():
                 if line.startswith("SB_") and "_PORT=" in line:
-                    ports.add(int(line.split("=", 1)[1]))
+                    first, _, last = line.split("=", 1)[1].partition("-")
+                    ports.update(range(int(first), int(last or first) + 1))
     return ports
 
 
-def next_port(start, taken):
+def next_port(start, taken, count=1):
+    """The first of count free ports in a row, from start on."""
     port = start
-    while port in taken or not port_free(port):
+    while any(p in taken or not port_free(p) for p in range(port, port + count)):
         port += 1
-    taken.add(port)
+    taken.update(range(port, port + count))
     return port
 
 
 def settings(name):
-    """What the instance runs with: the instance file over the defaults, plus what follows from them."""
-    values = read_env(name)
-    # With a known public address neko can run ICE lite; otherwise both sides discover addresses through STUN.
-    if values.get("SB_ICE_SERVERS"):
-        values["SB_ICE_LITE"] = "0"
-    elif values["SB_PUBLIC_IP"]:
-        values["SB_ICE_LITE"], values["SB_ICE_SERVERS"] = "1", "[]"
-    else:
-        values["SB_ICE_LITE"] = "0"
-        values["SB_ICE_SERVERS"] = json.dumps([{"urls": [values["SB_STUN"]]}]) if values["SB_STUN"] else "[]"
-    return values
+    """What the instance runs with: the instance file over the defaults."""
+    return read_env(name)
 
 
 def compose(name, *args, **kwargs):
@@ -169,11 +159,12 @@ def cmd_new(name, overrides):
     if env_path(name).exists():
         sys.exit(f"Instance '{name}' already exists: {env_path(name)}")
     taken = used_ports()
+    webrtc = next_port(59000, taken, WATCHERS)
     values = {
         "SB_NAME": name,
         "SB_WEB_PORT": next_port(8090, taken),
         "SB_CDP_PORT": next_port(9242, taken),
-        "SB_WEBRTC_PORT": next_port(59000, taken),
+        "SB_WEBRTC_PORT": f"{webrtc}-{webrtc + WATCHERS - 1}",
         "SB_PROFILE_DIR": Path.home() / ".local/share/shared-browser" / name / "profile",
         "SB_STATE_DIR": Path.home() / ".local/share/shared-browser" / name / "state",
         **DEFAULTS,
@@ -293,7 +284,7 @@ def cmd_endpoint(name, as_env):
         "cdp_url": f"{viewer}/cdp",
         "mcp_url": f"{viewer}/mcp",
         "cdp_local_url": f"http://127.0.0.1:{values['SB_CDP_PORT']}",
-        "webrtc_port": int(values["SB_WEBRTC_PORT"]),
+        "webrtc_ports": values["SB_WEBRTC_PORT"],
         "webrtc_bind": values["SB_WEBRTC_BIND"],
         "public_ip": values["SB_PUBLIC_IP"] or None,
     }

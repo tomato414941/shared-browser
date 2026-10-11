@@ -1,8 +1,6 @@
-import hashlib
 import http.client
 import importlib.util
 import json
-import socket
 import tempfile
 import threading
 import time
@@ -19,19 +17,25 @@ COOKIE = gate.COOKIE
 
 
 class FakeScreen(BaseHTTPRequestHandler):
-    """Stands in for the screen server: accepts a WebSocket from anyone and echoes what it is sent."""
+    """Stands in for the screen: answers like it does and remembers what it was asked."""
     seen = []
-    protocol_version = "HTTP/1.1"
+    peers = []
 
     def do_GET(self):
-        FakeScreen.seen.append((self.path, self.headers.get("Cookie"), self.headers.get("Authorization")))
-        self.send_response(101)
-        self.send_header("Upgrade", "websocket")
-        self.send_header("Connection", "Upgrade")
+        self.reply(FakeScreen.peers if self.path == "/peers" else {})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+        FakeScreen.seen.append((self.path, body, self.headers.get("Cookie")))
+        self.reply({"id": "peer-1", "sdp": "v=0 offer", "iceServers": []} if self.path == "/offer" else {})
+
+    def reply(self, body):
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.flush()
-        while data := self.connection.recv(1024):
-            self.connection.sendall(data)
+        self.wfile.write(data)
 
     def log_message(self, *_):
         pass
@@ -39,7 +43,7 @@ class FakeScreen(BaseHTTPRequestHandler):
 
 class GateTests(unittest.TestCase):
     def setUp(self):
-        FakeScreen.seen = []
+        FakeScreen.seen, FakeScreen.peers = [], []
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.links = Path(tmp.name) / "links.json"
@@ -65,13 +69,13 @@ class GateTests(unittest.TestCase):
         self.links.write_text(json.dumps([{"token": "one-time-token", "expires": expires or time.time() + 60, "as": who}]))
         return "/go/one-time-token"
 
-    def request(self, method, path, cookie=None, headers=None):
+    def request(self, method, path, cookie=None, headers=None, body=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request(method, path, headers={**({"Cookie": cookie} if cookie else {}), **(headers or {})})
+        conn.request(method, path, body, headers={**({"Cookie": cookie} if cookie else {}), **(headers or {})})
         res = conn.getresponse()
-        body = res.read().decode()
+        reply = res.read().decode()
         conn.close()
-        return res.status, {k.lower(): v for k, v in res.getheaders()}, body
+        return res.status, {k.lower(): v for k, v in res.getheaders()}, reply
 
     def press(self, path, headers=None):
         """Press the link's button; returns the status and the session cookie it set, as a Cookie header value."""
@@ -83,19 +87,11 @@ class GateTests(unittest.TestCase):
         grants[name]["revoked"] = True
         self.grants.write_text(json.dumps(grants))
 
-    def open_screen(self, cookie, origin=None):
-        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
-        sock.sendall((f"GET /screen/ws?username=someone-else&password=guess HTTP/1.1\r\nHost: {self.host}\r\n"
-                      f"Origin: {origin or 'http://' + self.host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
-                      f"Cookie: {cookie}\r\n\r\n").encode())
-        reply = b""
-        while b"\r\n\r\n" not in reply:
-            chunk = sock.recv(1024)
-            if not chunk:
-                break
-            reply += chunk
-        self.addCleanup(sock.close)
-        return sock, reply
+    def screen(self, path, cookie, body=None, origin=None):
+        """What the viewer page sends to the screen through the gate."""
+        headers = {"Origin": origin or f"http://{self.host}", "Content-Type": "application/json"}
+        status, _, reply = self.request("POST", path, cookie, headers, json.dumps(body or {}))
+        return status, reply
 
     # --- links ---
 
@@ -115,7 +111,6 @@ class GateTests(unittest.TestCase):
         status, cookie, headers = self.press(self.link())
         self.assertEqual((status, headers["location"]), (303, "/"))
         self.assertTrue(cookie.startswith(COOKIE + "="))
-        self.assertEqual(self.request("GET", "/_auth", cookie)[0], 204)
         self.assertEqual(json.loads(self.request("GET", "/whoami", cookie)[2]), {"name": "tomato"})
 
     def test_a_link_logs_in_only_once(self):
@@ -147,27 +142,27 @@ class GateTests(unittest.TestCase):
     # --- sessions ---
 
     def test_without_a_session_the_viewer_asks_for_a_link(self):
-        self.assertEqual(self.request("GET", "/_auth")[0], 401)
         self.assertEqual(self.request("GET", "/whoami")[0], 401)
-        for path in ("/", "/screen/", "/anything"):
+        for path in ("/", "/anything"):
             status, _, page = self.request("GET", path)
             self.assertEqual(status, 401)
             self.assertIn("Open this browser with a link.", page)
 
-    def test_the_viewer_is_the_gates_own_page_with_the_screen_as_one_part(self):
+    def test_the_viewer_is_a_page_showing_the_screen(self):
         _, cookie, _ = self.press(self.link())
-        status, _, page = self.request("GET", "/", cookie)
+        status, headers, page = self.request("GET", "/", cookie)
         self.assertEqual(status, 200)
+        self.assertTrue(headers["content-type"].startswith("text/html"))
         self.assertIn("<title>Browser</title>", page)
-        self.assertIn('<iframe id="screen" title="Screen" src="screen/?embed=1&amp;usr=tomato&amp;pwd=-"', page)
+        self.assertIn('<video id="screen"', page)
 
     def test_a_made_up_cookie_is_not_a_session(self):
-        self.assertEqual(self.request("GET", "/_auth", f"{COOKIE}=guess")[0], 401)
+        self.assertEqual(self.request("GET", "/whoami", f"{COOKIE}=guess")[0], 401)
 
     def test_revoking_a_principal_ends_its_sessions(self):
         _, cookie, _ = self.press(self.link())
         self.revoke("tomato")
-        self.assertEqual(self.request("GET", "/_auth", cookie)[0], 401)
+        self.assertEqual(self.request("GET", "/whoami", cookie)[0], 401)
 
     def test_the_session_cookie_is_secure_only_behind_https(self):
         _, _, plain = self.press(self.link())
@@ -176,35 +171,46 @@ class GateTests(unittest.TestCase):
         self.assertIn("Secure", behind_https["set-cookie"])
         self.assertIn("HttpOnly", behind_https["set-cookie"])
 
-    # --- the screen's live connection ---
+    # --- the screen ---
 
-    def test_the_screen_is_joined_under_the_principals_own_name(self):
+    def test_the_screen_is_reached_under_the_sessions_own_principal(self):
         _, cookie, _ = self.press(self.link())
-        sock, reply = self.open_screen(cookie)
-        self.assertTrue(reply.startswith(b"HTTP/1.1 101"))
-        sock.sendall(b"frame")
-        self.assertEqual(sock.recv(1024), b"frame")
-        path, passed_cookie, _ = FakeScreen.seen[-1]
-        self.assertEqual(path, "/screen/ws?username=tomato&password=-")
+        status, reply = self.screen("/screen", cookie, {"as": "someone-else"})
+        self.assertEqual((status, json.loads(reply)["id"]), (200, "peer-1"))
+        path, body, passed_cookie = FakeScreen.seen[-1]
+        self.assertEqual((path, body["as"]), ("/offer", "tomato"))
+        self.assertTrue(body["session"])
         self.assertIsNone(passed_cookie)
 
-    def test_the_screen_refuses_a_connection_without_a_session(self):
-        _, reply = self.open_screen(f"{COOKIE}=guess")
-        self.assertTrue(reply.startswith(b"HTTP/1.0 401"))
+    def test_the_viewers_answer_reaches_the_screen_under_the_same_principal(self):
+        _, cookie, _ = self.press(self.link())
+        self.screen("/screen/answer", cookie, {"id": "peer-1", "sdp": "v=0 answer", "as": "someone-else"})
+        self.assertEqual(FakeScreen.seen[-1][:2], ("/answer", {"id": "peer-1", "as": "tomato", "sdp": "v=0 answer"}))
+
+    def test_the_viewer_can_hang_up(self):
+        _, cookie, _ = self.press(self.link())
+        self.screen("/screen/close", cookie, {"id": "peer-1"})
+        self.assertEqual(FakeScreen.seen[-1][:2], ("/close", {"id": "peer-1", "as": "tomato"}))
+
+    def test_the_screen_refuses_without_a_session(self):
+        self.assertEqual(self.screen("/screen", f"{COOKIE}=guess")[0], 401)
         self.assertEqual(FakeScreen.seen, [])
 
-    def test_the_screen_refuses_a_connection_started_by_another_site(self):
+    def test_the_screen_refuses_a_request_started_by_another_site(self):
         _, cookie, _ = self.press(self.link())
-        _, reply = self.open_screen(cookie, origin="https://elsewhere.example")
-        self.assertTrue(reply.startswith(b"HTTP/1.0 403"))
+        self.assertEqual(self.screen("/screen", cookie, origin="https://elsewhere.example")[0], 403)
         self.assertEqual(FakeScreen.seen, [])
 
     def test_revoking_closes_the_screen_connection_at_once(self):
         _, cookie, _ = self.press(self.link())
-        sock, _ = self.open_screen(cookie)
+        self.screen("/screen", cookie)
+        session = FakeScreen.seen[-1][1]["session"]
+        FakeScreen.peers = [{"id": "peer-1", "as": "tomato", "session": session}]
+        gate.enforce()
+        self.assertNotIn("/close", [path for path, _, _ in FakeScreen.seen])
         self.revoke("tomato")
         gate.enforce()
-        self.assertEqual(sock.recv(1024), b"")
+        self.assertEqual(FakeScreen.seen[-1][:2], ("/close", {"id": "peer-1"}))
 
 
 if __name__ == "__main__":

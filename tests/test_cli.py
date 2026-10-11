@@ -68,21 +68,16 @@ class CliTests(unittest.TestCase):
 
     def test_a_new_instance_assumes_no_network_and_discovers_addresses_through_stun(self):
         self.run_cli("new", "c", f"SB_PROFILE_DIR={self.root / 'c'}")
-        env = (self.root / "instances" / "c.env").read_text()
-        self.assertIn("SB_PUBLIC_IP=\n", env)
-        self.assertIn("SB_WEBRTC_BIND=0.0.0.0", env)
         conf = self.config("c")
-        self.assertEqual(conf["SB_ICE_LITE"], "0")
-        self.assertIn("stun:", conf["SB_ICE_SERVERS"])
+        self.assertEqual((conf["SB_PUBLIC_IP"], conf["SB_WEBRTC_BIND"]), ("", "0.0.0.0"))
+        self.assertTrue(conf["SB_STUN"].startswith("stun:"))
 
-    def test_a_known_public_address_turns_on_ice_lite(self):
-        self.run_cli("new", "d", f"SB_PROFILE_DIR={self.root / 'd'}", "SB_PUBLIC_IP=203.0.113.5")
-        conf = self.config("d")
-        self.assertEqual((conf["SB_ICE_LITE"], conf["SB_ICE_SERVERS"]), ("1", "[]"))
-
-    def test_an_instance_has_no_passwords(self):
-        self.assertNotIn("PASSWORD", (self.root / "instances" / "b.env").read_text())
-        self.assertNotIn("password", self.run_cli("endpoint", "b").stdout)
+    def test_each_new_instance_gets_its_own_ports_for_four_people_watching_at_once(self):
+        self.run_cli("new", "c", f"SB_PROFILE_DIR={self.root / 'c'}")
+        b, c = self.config("b")["SB_WEBRTC_PORT"], self.config("c")["SB_WEBRTC_PORT"]
+        ranges = [range(int(first), int(last) + 1) for first, last in (b.split("-"), c.split("-"))]
+        self.assertEqual([len(r) for r in ranges], [4, 4])
+        self.assertFalse(set(ranges[0]) & set(ranges[1]))
 
     def test_endpoint_says_what_to_reach_and_whether_a_front_is_set(self):
         out = json.loads(self.run_cli("endpoint", "b").stdout)

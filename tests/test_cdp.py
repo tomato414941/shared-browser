@@ -98,8 +98,11 @@ class CdpTests(unittest.TestCase):
         chrome = serve(self, FakeChrome)
         self.chrome = f"127.0.0.1:{chrome.server_port}"
         self.links = Path(tmp.name) / "links.json"
+        nothing = socket.socket()
+        nothing.bind(("127.0.0.1", 0))
         settings = patch.multiple(gate, GRANTS=self.grants, LINKS=self.links, CDP=self.chrome, BASE="https://browser.example",
-                                  MCP=mcp.expected_host)
+                                  MCP=mcp.expected_host, SCREEN=f"127.0.0.1:{nothing.getsockname()[1]}")
+        nothing.close()
         settings.start()
         self.addCleanup(settings.stop)
         self.gate = serve(self, gate.Gate)

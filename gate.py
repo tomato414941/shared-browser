@@ -4,8 +4,9 @@
 People:
   GET  /go/<token>   shows a button, so link previews in chat apps do not use the link up.
   POST /go/<token>   uses the link and starts a viewer session for its principal, kept as a cookie.
-  GET  /             the page a person uses the browser from. It is this gate's own page; the live screen is one
-                     part of it, loaded from under /screen/.
+  GET  /             the page a person uses the browser from: the screen, taking their mouse, keys and touches.
+  POST /screen, /screen/answer, /screen/close
+                     that page's connection to the screen (screen.py), always made under the session's principal.
 
 Agents:
   /cdp/...           the Chrome DevTools Protocol, for a principal whose key allows "cdp".
@@ -14,12 +15,8 @@ Agents:
                      an agent brings a person in when it needs them; what for, it says itself when it passes the link.
   Keys travel in the Authorization header, so they stay out of URLs and logs.
 
-The screen:
-  Whatever shows the browser's screen and takes input lives under /screen/ and has no say in who comes in. Each
-  request to it is checked against the viewer session (nginx asks /_auth), and its live connection passes through
-  here. What this gate knows about the particular screen server is kept in the two functions under "the screen".
-
-Revoking a principal takes effect at once: its open connections are closed and its sessions stop working.
+Revoking a principal takes effect at once: its open connections, the screen's included, are closed and its
+sessions stop working.
 """
 import fcntl
 import hashlib
@@ -38,17 +35,18 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-STATE = Path(os.environ.get("GATE_STATE", "/home/neko/state"))
+STATE = Path(os.environ.get("GATE_STATE", "/home/browser/state"))
 LINKS = STATE / "links.json"
 GRANTS = STATE / "grants.json"
 SESSIONS = STATE / "sessions.json"
-SCREEN = os.environ.get("GATE_SCREEN", "127.0.0.1:8081")   # the screen server, which has no authentication
+SCREEN = os.environ.get("GATE_SCREEN", "127.0.0.1:8081")   # the screen, which has no authentication
 CDP = os.environ.get("GATE_CDP", "127.0.0.1:9222")
 MCP = os.environ.get("GATE_MCP", "localhost:8083")          # the bundled MCP server only answers to this Host
 BASE = os.environ.get("GATE_BASE", "").rstrip("/")          # the URL people and agents use to reach this browser
 COOKIE = "shared_browser_" + re.sub(r"[^A-Za-z0-9_]", "_", os.environ.get("GATE_NAME", "browser"))
 SESSION_SECONDS = float(os.environ.get("GATE_SESSION_HOURS", "720")) * 3600
-PORT = int(os.environ.get("GATE_PORT", "8082"))
+PORT = int(os.environ.get("GATE_PORT", "8080"))
+VIEWER = Path(__file__).with_name("viewer.html")
 
 # Open connections through the gate, so a revocation can close them: id -> (still allowed?, sockets).
 ACTIVE = {}
@@ -66,18 +64,6 @@ button{font:inherit;padding:14px 32px;border:0;border-radius:10px;background:#37
 OPEN = '<form method="post" action="__ACTION__"><button type="submit">Open the browser</button></form>'
 GONE = "<p>This link is no longer valid.</p>"
 NEED_LINK = "<p>Open this browser with a link.</p>"
-
-# The page a person uses the browser from. The screen fills it; when the session ends, the page says so.
-VIEWER = HEAD + """
-<style>html,body{margin:0;height:100%;background:#000}iframe{display:block;width:100%;height:100%;border:0}</style>
-</head><body>
-<iframe id="screen" title="Screen" src="__SCREEN__" allow="autoplay; fullscreen; clipboard-read; clipboard-write"></iframe>
-<script>
-setInterval(async () => {
-  const res = await fetch('whoami', {cache: 'no-store'}).catch(() => null);
-  if (res && res.status === 401) location.reload();
-}, 5000);
-</script></body></html>"""
 
 
 def digest(secret):
@@ -106,16 +92,20 @@ def locked(path, default):
         f.seek(0), f.truncate(), json.dump(box[0], f)
 
 
-# --- the screen: all this gate knows about the particular screen server (neko) ---
+# --- the screen ---
 
-def screen_page(name):
-    """The address, under /screen/, that shows only the screen and joins it as name without asking anything."""
-    return "screen/?" + urllib.parse.urlencode({"embed": 1, "usr": name, "pwd": "-"})
-
-
-def screen_connection(path, name):
-    """The screen's live connection for name, whatever name the page asked for."""
-    return path + "?" + urllib.parse.urlencode({"username": name, "password": "-"})
+def screen(method, path, body=None):
+    """Ask the screen; (status, JSON reply), or (503, None) when it does not answer."""
+    host, port = SCREEN.split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=15)
+    try:
+        conn.request(method, path, None if body is None else json.dumps(body), {"Content-Type": "application/json"})
+        res = conn.getresponse()
+        return res.status, json.loads(res.read() or b"null")
+    except (OSError, ValueError):
+        return 503, None
+    finally:
+        conn.close()
 
 
 # --- principals ---
@@ -199,6 +189,10 @@ def enforce():
                 sock.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
+    status, peers = screen("GET", "/peers")
+    for peer in peers if status == 200 else []:
+        if session_holder(peer.get("session")) != peer.get("as"):
+            screen("POST", "/close", {"id": peer.get("id")})
 
 
 def watch():
@@ -234,7 +228,7 @@ class Gate(BaseHTTPRequestHandler):
         return BASE.startswith("https://") or self.headers.get("X-Forwarded-Proto") == "https"
 
     def same_origin(self):
-        """A WebSocket must come from a page of this browser, not from some other site the person has open."""
+        """What acts for a viewer must come from a page of this browser, not from another site the person has open."""
         origin = urllib.parse.urlsplit(self.headers.get("Origin", "")).netloc
         return bool(origin) and origin in (self.headers.get("Host"), urllib.parse.urlsplit(BASE).netloc)
 
@@ -274,16 +268,14 @@ class Gate(BaseHTTPRequestHandler):
             return self.use_link() if self.command == "POST" else self.show_link()
         if path == "/link" and self.command == "POST":
             return self.make_link()
+        if path in ("/screen", "/screen/answer", "/screen/close") and self.command == "POST":
+            return self.screen_door(path)
         name = self.viewer()[0]
-        if self.command in ("GET", "HEAD"):
-            if path == "/_auth":
-                return self.plain(204 if name else 401, "")
-            if path == "/whoami" and name:
+        if self.command in ("GET", "HEAD") and name:
+            if path == "/whoami":
                 return self.send(200, "application/json", json.dumps({"name": name}))
-            if path.startswith("/screen/") and self.headers.get("Upgrade", "").lower() == "websocket":
-                return self.screen_socket()
-            if path == "/" and name:
-                return self.send(200, "text/html; charset=utf-8", VIEWER.replace("__SCREEN__", html.escape(screen_page(name))))
+            if path == "/":
+                return self.send(200, "text/html; charset=utf-8", VIEWER.read_text())
         self.page(401, NEED_LINK)
 
     do_GET = do_HEAD = do_POST = do_PUT = do_DELETE = route
@@ -314,17 +306,27 @@ class Gate(BaseHTTPRequestHandler):
         cookie = f"{COOKIE}={start_session(who)}; Path=/; Max-Age={int(SESSION_SECONDS)}; HttpOnly; SameSite=Lax"
         self.redirect(303, cookie + ("; Secure" if self.https() else ""))
 
-    def screen_socket(self):
-        """The viewer's live connection to the screen, under the principal's own name."""
+    def screen_door(self, path):
+        """The viewer page's connection to the screen, always under the session's own principal."""
         name, session_digest = self.viewer()
         if not name:
             self.plain(401, "A link is needed.")
             return
         if not self.same_origin():
-            self.plain(403, "This connection must come from the browser's own page.")
+            self.plain(403, "This must come from the browser's own page.")
             return
-        path = screen_connection(self.path.split("?", 1)[0], name)
-        self.tunnel(SCREEN, path, lambda: session_holder(session_digest) == name)
+        try:
+            body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length") or 0), 65536)) or b"{}")
+            body = body if isinstance(body, dict) else {}
+        except ValueError:
+            body = {}
+        if path == "/screen":
+            status, reply = screen("POST", "/offer", {"as": name, "session": session_digest})
+        elif path == "/screen/answer":
+            status, reply = screen("POST", "/answer", {"id": body.get("id"), "as": name, "sdp": body.get("sdp")})
+        else:
+            status, reply = screen("POST", "/close", {"id": body.get("id"), "as": name})
+        self.send(status, "application/json", json.dumps(reply))
 
     # --- agents ---
 
@@ -435,4 +437,4 @@ class Gate(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     threading.Thread(target=watch, daemon=True).start()
-    ThreadingHTTPServer(("127.0.0.1", PORT), Gate).serve_forever()
+    ThreadingHTTPServer(("", PORT), Gate).serve_forever()

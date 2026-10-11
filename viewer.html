@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex">
+<meta name="referrer" content="no-referrer">
+<title>Browser</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='5' width='26' height='22' rx='4' fill='%236b7280'/%3E%3Crect x='6' y='11' width='20' height='13' rx='2' fill='%23f3f4f6'/%3E%3C/svg%3E">
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+video{display:block;width:100%;height:100%;object-fit:contain;outline:none;touch-action:none}
+#status{position:fixed;inset:0;display:grid;place-items:center;color:#9ca3af;font:15px system-ui,sans-serif;pointer-events:none}
+</style>
+</head>
+<body>
+<video id="screen" autoplay muted playsinline tabindex="0"></video>
+<div id="status">Connecting…</div>
+<script>
+// The browser's screen, and the mouse, keys and touches sent back to it.
+const video = document.getElementById('screen');
+const status = document.getElementById('status');
+let pc = null, channel = null, id = null, retry = null;
+
+const post = (path, body) => fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
+                                          body: JSON.stringify(body)});
+
+async function connect() {
+  clearTimeout(retry);
+  if (pc) pc.close();
+  pc = channel = null;
+  status.hidden = false;
+  try {
+    const res = await post('screen', {});
+    if (res.status === 401) return location.reload();
+    const offer = await res.json().catch(() => null);
+    status.textContent = offer && offer.error === 'full' ? 'Too many people are watching. Waiting for a place…'
+                                                         : 'Connecting…';
+    if (!res.ok) throw new Error(res.status);
+    id = offer.id;
+    const peer = pc = new RTCPeerConnection({iceServers: offer.iceServers || []});
+    peer.ontrack = e => { video.srcObject = new MediaStream([e.track]); };
+    peer.ondatachannel = e => { channel = e.channel; };
+    peer.onconnectionstatechange = () => {
+      if (peer !== pc) return;
+      if (peer.connectionState === 'failed') again(1000);
+      if (peer.connectionState === 'disconnected') again(5000);
+      if (peer.connectionState === 'connected') clearTimeout(retry);
+    };
+    await peer.setRemoteDescription({type: 'offer', sdp: offer.sdp});
+    await peer.setLocalDescription(await peer.createAnswer());
+    await new Promise(resolve => {
+      if (peer.iceGatheringState === 'complete') return resolve();
+      peer.addEventListener('icegatheringstatechange', () => peer.iceGatheringState === 'complete' && resolve());
+      setTimeout(resolve, 3000);
+    });
+    for (const r of peer.getReceivers()) if ('jitterBufferTarget' in r) r.jitterBufferTarget = 0;
+    const answered = await post('screen/answer', {id, sdp: peer.localDescription.sdp});
+    if (!answered.ok) throw new Error(answered.status);
+  } catch (e) {
+    again(3000);
+  }
+}
+
+function again(ms) {
+  clearTimeout(retry);
+  retry = setTimeout(connect, ms);
+}
+
+video.addEventListener('playing', () => { status.hidden = true; });
+addEventListener('pagehide', () => {
+  if (id) navigator.sendBeacon('screen/close', JSON.stringify({id}));
+});
+
+// Where a point on the page falls on the screen, which is shown whole and centered.
+function at(e) {
+  const r = video.getBoundingClientRect(), w = video.videoWidth || 1, h = video.videoHeight || 1;
+  const scale = Math.min(r.width / w, r.height / h);
+  return {x: Math.round((e.clientX - r.left - (r.width - w * scale) / 2) / scale),
+          y: Math.round((e.clientY - r.top - (r.height - h * scale) / 2) / scale)};
+}
+
+function send(message) {
+  if (channel && channel.readyState === 'open') channel.send(JSON.stringify(message));
+}
+
+// Mouse: moves at most once a frame; buttons and the wheel as they come.
+let move = null;
+function moveTo(point) {
+  if (!move) requestAnimationFrame(() => { send({t: 'move', ...move}); move = null; });
+  move = point;
+}
+const BUTTONS = {0: 1, 1: 2, 2: 3, 3: 8, 4: 9};
+video.addEventListener('pointermove', e => { if (e.pointerType === 'mouse') moveTo(at(e)); });
+video.addEventListener('pointerdown', e => {
+  video.focus();
+  if (e.pointerType === 'mouse') send({t: 'button', b: BUTTONS[e.button] || 1, down: true, ...at(e)});
+  else touchStart(e);
+});
+video.addEventListener('pointerup', e => {
+  if (e.pointerType === 'mouse') send({t: 'button', b: BUTTONS[e.button] || 1, down: false, ...at(e)});
+  else touchEnd(e);
+});
+video.addEventListener('contextmenu', e => e.preventDefault());
+video.addEventListener('wheel', e => {
+  e.preventDefault();
+  const unit = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1;
+  send({t: 'wheel', dx: e.deltaX * unit, dy: e.deltaY * unit});
+}, {passive: false});
+
+// Keys go to the screen while it has focus, including ones the page would otherwise act on.
+const typing = e => document.activeElement === video && !e.isComposing && e.key !== 'Process';
+addEventListener('keydown', e => {
+  if (!typing(e)) return;
+  e.preventDefault();
+  send({t: 'key', down: true, key: e.key, code: e.code});
+});
+addEventListener('keyup', e => {
+  if (!typing(e)) return;
+  e.preventDefault();
+  send({t: 'key', down: false, key: e.key, code: e.code});
+});
+addEventListener('blur', () => send({t: 'release'}));
+
+// Touch: a tap clicks, a drag scrolls, a long press is a right click.
+let touch = null;
+function touchStart(e) {
+  if (touch) return;
+  touch = {pointer: e.pointerId, x: e.clientX, y: e.clientY, at: at(e), time: Date.now(), dragging: false};
+  video.setPointerCapture(e.pointerId);
+}
+video.addEventListener('pointermove', e => {
+  if (!touch || e.pointerId !== touch.pointer) return;
+  const dx = e.clientX - touch.x, dy = e.clientY - touch.y;
+  if (!touch.dragging && Math.hypot(dx, dy) < 10) return;
+  touch.dragging = true;
+  const r = video.getBoundingClientRect();
+  const scale = Math.min(r.width / (video.videoWidth || 1), r.height / (video.videoHeight || 1));
+  send({t: 'move', ...touch.at});
+  send({t: 'wheel', dx: -dx / scale, dy: -dy / scale});
+  touch.x = e.clientX;
+  touch.y = e.clientY;
+});
+function touchEnd(e) {
+  if (!touch || e.pointerId !== touch.pointer) return;
+  if (!touch.dragging) {
+    const b = Date.now() - touch.time > 600 ? 3 : 1;
+    send({t: 'button', b, down: true, ...touch.at});
+    send({t: 'button', b, down: false, ...touch.at});
+  }
+  touch = null;
+}
+video.addEventListener('pointercancel', () => { touch = null; });
+
+// When the session ends, reload: the gate then says how to come back.
+setInterval(async () => {
+  const res = await fetch('whoami', {cache: 'no-store'}).catch(() => null);
+  if (res && res.status === 401) location.reload();
+}, 5000);
+
+connect();
+</script>
+</body>
+</html>
