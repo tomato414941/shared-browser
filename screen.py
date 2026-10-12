@@ -7,11 +7,11 @@ It listens on loopback and trusts whoever reaches it; the gate decides who that 
   POST /close   {"id", ["as"]}
   GET  /peers                           -> [{"id", "as", "session"}]
 
-Each connection has its own encoder, so each gets the rate its own link carries. Mouse and keys arrive on the
-connection's data channel and are played into the display as if from a real mouse and keyboard. Text arrives there
-too, made on the viewer's device by its own keyboard or input method, and goes in through an input method of the
-screen's own, wherever a field has focus: a page, the address bar, a dialog. The same channel tells every viewer when
-a field has focus, and where the page's fields are.
+The display is captured once for everyone, and each connection has its own encoder, so each gets the rate its own
+link carries. Mouse and keys arrive on the connection's data channel and are played into the display as if from a
+real mouse and keyboard. Text arrives there too, made on the viewer's device by its own keyboard or input method, and
+goes in through an input method of the screen's own, wherever a field has focus: a page, the address bar, a dialog.
+The same channel tells every viewer when a field has focus, and where the page's fields are.
 """
 import ctypes
 import json
@@ -52,6 +52,8 @@ RTP = ("application/x-rtp,media=video,encoding-name=H264,payload=102,clock-rate=
        "extmap-1=(string)http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01")
 
 Gst.init(None)
+CLOCK = Gst.SystemClock.obtain()
+BASE = CLOCK.get_time()
 PEERS = {}
 PEERS_LOCK = threading.Lock()
 
@@ -566,7 +568,7 @@ class ScreenField(IBus.Engine):
         return False   # keys pass as they come
 
 
-INPUT = BROWSER = TYPING = None
+INPUT = BROWSER = TYPING = CAPTURE = None
 
 
 def turn_url(server, url):
@@ -592,19 +594,70 @@ def reachable(sdp):
     return "\r\n".join(lines)
 
 
+def timed(pipe):
+    """Every pipeline counts time on one clock from one moment, so a frame's time means the same in each."""
+    pipe.use_clock(CLOCK)
+    pipe.set_start_time(Gst.CLOCK_TIME_NONE)
+    pipe.set_base_time(BASE)
+    return pipe
+
+
+class Capture:
+    """The display, captured once for everyone watching. Each connection encodes these frames at its own rate.
+
+    Once, not once for each connection: ximagesrc holds the X server grabbed while it takes a frame, and takes
+    Xlib's process-wide lock on the way. A second ximagesrc opening its display holds that lock while it waits for
+    the server, which the grab keeps from answering. The two wait for each other, and the X server stays grabbed:
+    the browser and every picture stop.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pipe = None
+        self.watching = ()   # each connection's appsrc; replaced whole, so frames go out without the lock
+
+    def join(self, frames):
+        with self.lock:
+            if self.pipe is None:
+                self.pipe = timed(Gst.parse_launch(
+                    f"ximagesrc display-name={DISPLAY} use-damage=false show-pointer=true "
+                    f"! video/x-raw,framerate={FPS}/1 ! videoconvert n-threads=4 ! video/x-raw,format=I420 "
+                    "! appsink name=frames emit-signals=true max-buffers=1 drop=true sync=false"))
+                self.pipe.get_by_name("frames").connect("new-sample", self.send)
+                bus = self.pipe.get_bus()
+                bus.add_signal_watch()
+                bus.connect("message::error", lambda _bus, message: print("capture error:", message.parse_error(),
+                                                                          flush=True))
+                self.pipe.set_state(Gst.State.PLAYING)
+            self.watching += (frames,)
+
+    def leave(self, frames):
+        with self.lock:
+            self.watching = tuple(other for other in self.watching if other is not frames)
+            if not self.watching and self.pipe is not None:
+                self.pipe.set_state(Gst.State.NULL)
+                self.pipe.get_bus().remove_signal_watch()
+                self.pipe = None
+
+    def send(self, sink):
+        sample = sink.emit("pull-sample")
+        for frames in self.watching:
+            frames.emit("push-sample", sample)   # never waits: a connection that is behind drops its older frame
+        return Gst.FlowReturn.OK
+
+
 class Peer:
-    """One person's connection: a capture, an encoder and a WebRTC endpoint of its own."""
+    """One person's connection: an encoder and a WebRTC endpoint of its own, fed from the one capture."""
 
     def __init__(self, who, session):
         self.id, self.who, self.session = secrets.token_urlsafe(12), who, session
         self.closed = False
-        self.pipe = Gst.parse_launch(
-            f"ximagesrc display-name={DISPLAY} use-damage=false show-pointer=true ! video/x-raw,framerate={FPS}/1 "
-            "! videoconvert n-threads=4 ! video/x-raw,format=I420 "
-            "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
+        self.pipe = timed(Gst.parse_launch(
+            "appsrc name=frames is-live=true format=time max-buffers=1 max-bytes=0 leaky-type=downstream "
             f"! x264enc name=encoder tune=zerolatency speed-preset=ultrafast key-int-max={FPS * 60} vbv-buf-capacity=120 "
             "! video/x-h264,profile=constrained-baseline ! rtph264pay config-interval=-1 aggregate-mode=zero-latency "
-            f"! {RTP} ! webrtcbin name=webrtc bundle-policy=max-bundle")
+            f"! {RTP} ! webrtcbin name=webrtc bundle-policy=max-bundle"))
+        self.frames = self.pipe.get_by_name("frames")
         self.webrtc = self.pipe.get_by_name("webrtc")
         encoder = self.pipe.get_by_name("encoder")
         self.rate = Rate(lambda kbps: encoder.set_property("bitrate", int(kbps)), KBPS)
@@ -644,6 +697,7 @@ class Peer:
         done.wait()
         gathered.wait(5)
         self.offer = reachable(self.webrtc.get_property("local-description").sdp.as_text())
+        CAPTURE.join(self.frames)
         GLib.timeout_add_seconds(30, weakly(self.close_if_unanswered))
 
     def answer(self, sdp):
@@ -679,6 +733,7 @@ class Peer:
                 return
             self.closed = True
             PEERS.pop(self.id, None)
+        CAPTURE.leave(self.frames)
         self.pipe.set_state(Gst.State.NULL)
         self.pipe.get_bus().remove_signal_watch()
 
@@ -733,5 +788,6 @@ if __name__ == "__main__":
     INPUT = Input()
     TYPING = Typing()
     BROWSER = Browser()
+    CAPTURE = Capture()
     threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
