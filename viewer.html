@@ -9,7 +9,7 @@
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='5' width='26' height='22' rx='4' fill='%236b7280'/%3E%3Crect x='6' y='11' width='20' height='13' rx='2' fill='%23f3f4f6'/%3E%3C/svg%3E">
 <style>
 html,body{margin:0;height:100%;background:#000;overflow:hidden}
-video{display:block;width:100%;height:100%;object-fit:contain;outline:none;touch-action:none}
+video{display:block;width:100%;height:100%;object-fit:contain;object-position:top;outline:none;touch-action:none}
 #field{position:fixed;left:0;top:0;width:1px;height:1px;margin:0;padding:0;border:0;opacity:0;font-size:16px;pointer-events:none}
 #status{position:fixed;inset:0;display:grid;place-items:center;color:#9ca3af;font:15px system-ui,sans-serif;pointer-events:none}
 #status[hidden]{display:none}
@@ -85,11 +85,12 @@ addEventListener('pagehide', () => {
   if (id) post('screen/close', {id}, true);
 });
 
-// How the screen, shown whole and centered, sits on this page.
+// How the screen sits on this page: whole, at the top, centered across. At the top, the keyboard of a device held
+// upright comes up below it rather than over it.
 function fit() {
   const r = video.getBoundingClientRect(), w = video.videoWidth || 1, h = video.videoHeight || 1;
   const scale = Math.min(r.width / w, r.height / h);
-  return {scale, left: r.left + (r.width - w * scale) / 2, top: r.top + (r.height - h * scale) / 2};
+  return {scale, left: r.left + (r.width - w * scale) / 2, top: r.top};
 }
 
 // Where a point on this page falls on the screen.
