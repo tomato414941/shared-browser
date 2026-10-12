@@ -16,6 +16,7 @@ import os
 import secrets
 import threading
 import time
+import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import gi
@@ -61,6 +62,17 @@ def limit_ports(webrtc):
     GOBJECT.g_object_set(agent, b"min-rtp-port", ctypes.c_uint(PORTS.start),
                          b"max-rtp-port", ctypes.c_uint(PORTS.stop - 1), None)
     GOBJECT.g_object_unref(agent)
+
+
+def weakly(method):
+    """A handler that does not keep its connection alive.
+
+    The connection's own elements hold these handlers, and Python cannot follow a reference out of an element its
+    pipeline also holds. A handler holding the connection would make a loop that is never freed, and a closed
+    connection would keep its port.
+    """
+    ref = weakref.WeakMethod(method)
+    return lambda *args: (bound := ref()) is not None and bound(*args)
 
 
 class Rate:
@@ -272,7 +284,7 @@ class Peer:
         gathered = threading.Event()
         self.webrtc.connect("notify::ice-gathering-state", lambda element, _: gathered.set() if element.get_property(
             "ice-gathering-state") == GstWebRTC.WebRTCICEGatheringState.COMPLETE else None)
-        self.webrtc.connect("notify::connection-state", self.on_state)
+        self.webrtc.connect("notify::connection-state", weakly(self.on_state))
         bus = self.pipe.get_bus()
         bus.add_signal_watch()
         bus.connect("message::error", lambda _bus, message: print("screen error:", message.parse_error(), flush=True))
@@ -295,14 +307,14 @@ class Peer:
         done.wait()
         gathered.wait(5)
         self.offer = reachable(self.webrtc.get_property("local-description").sdp.as_text())
-        GLib.timeout_add_seconds(30, self.close_if_unanswered)
+        GLib.timeout_add_seconds(30, weakly(self.close_if_unanswered))
 
     def answer(self, sdp):
         _, message = GstSdp.SDPMessage.new_from_text(sdp)
         self.webrtc.emit("set-remote-description",
                          GstWebRTC.WebRTCSessionDescription.new(GstWebRTC.WebRTCSDPType.ANSWER, message), Gst.Promise.new())
         session = self.webrtc.get_by_name("rtpbin").emit("get-session", 0)
-        session.connect("notify::twcc-stats", self.on_feedback)
+        session.connect("notify::twcc-stats", weakly(self.on_feedback))
 
     def on_feedback(self, session, _):
         stats = session.get_property("twcc-stats")
@@ -327,6 +339,7 @@ class Peer:
             self.closed = True
             PEERS.pop(self.id, None)
         self.pipe.set_state(Gst.State.NULL)
+        self.pipe.get_bus().remove_signal_watch()
 
 
 class Handler(BaseHTTPRequestHandler):
