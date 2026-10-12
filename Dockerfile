@@ -11,7 +11,8 @@ ARG CHROME_DEB=https://dl.google.com/linux/direct/google-chrome-stable_current_a
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates wget supervisor xvfb x11-utils openbox socat \
-        python3 python3-gi python3-xlib gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gst-plugins-bad-1.0 \
+        python3 python3-gi python3-xlib python3-websockets \
+        gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gst-plugins-bad-1.0 \
         gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
         gstreamer1.0-nice gstreamer1.0-x fonts-noto-cjk fonts-noto-color-emoji; \
     if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
@@ -30,7 +31,7 @@ COPY --from=mcp /usr/local/bin/node /usr/local/bin/node
 COPY --from=mcp /opt/mcp /opt/mcp
 COPY policies.json /etc/opt/chrome/policies/managed/policies.json
 COPY policies.json /etc/chromium/policies/managed/policies.json
-COPY supervisord.conf openbox.xml gate.py screen.py viewer.html /opt/shared-browser/
+COPY supervisord.conf openbox.xml gate.py screen.py fields.js viewer.html /opt/shared-browser/
 
 USER browser
 ENV DISPLAY=:99

@@ -10,15 +10,18 @@
 <style>
 html,body{margin:0;height:100%;background:#000;overflow:hidden}
 video{display:block;width:100%;height:100%;object-fit:contain;outline:none;touch-action:none}
+#field{position:fixed;left:0;top:0;width:1px;height:1px;margin:0;padding:0;border:0;opacity:0;font-size:16px;pointer-events:none}
 #status{position:fixed;inset:0;display:grid;place-items:center;color:#9ca3af;font:15px system-ui,sans-serif;pointer-events:none}
 </style>
 </head>
 <body>
 <video id="screen" autoplay muted playsinline tabindex="0"></video>
+<input id="field" autocomplete="off">
 <div id="status">Connecting…</div>
 <script>
-// The browser's screen, and the mouse, keys and touches sent back to it.
+// The browser's screen, and the mouse, keys, touches and text sent back to it.
 const video = document.getElementById('screen');
+const field = document.getElementById('field');
 const status = document.getElementById('status');
 let pc = null, channel = null, id = null, retry = null;
 
@@ -41,7 +44,13 @@ async function connect() {
     id = offer.id;
     const peer = pc = new RTCPeerConnection({iceServers: offer.iceServers || []});
     peer.ontrack = e => { video.srcObject = new MediaStream([e.track]); };
-    peer.ondatachannel = e => { channel = e.channel; };
+    peer.ondatachannel = e => {
+      channel = e.channel;
+      channel.onmessage = m => {
+        const message = JSON.parse(m.data);
+        if (message.t === 'page') follow(message);
+      };
+    };
     peer.onconnectionstatechange = () => {
       if (peer !== pc) return;
       if (peer.connectionState === 'failed') again(1000);
@@ -75,12 +84,17 @@ addEventListener('pagehide', () => {
   if (id) post('screen/close', {id}, true);
 });
 
-// Where a point on the page falls on the screen, which is shown whole and centered.
-function at(e) {
+// How the screen, shown whole and centered, sits on this page.
+function fit() {
   const r = video.getBoundingClientRect(), w = video.videoWidth || 1, h = video.videoHeight || 1;
   const scale = Math.min(r.width / w, r.height / h);
-  return {x: Math.round((e.clientX - r.left - (r.width - w * scale) / 2) / scale),
-          y: Math.round((e.clientY - r.top - (r.height - h * scale) / 2) / scale)};
+  return {scale, left: r.left + (r.width - w * scale) / 2, top: r.top + (r.height - h * scale) / 2};
+}
+
+// Where a point on this page falls on the screen.
+function at(e) {
+  const f = fit();
+  return {x: Math.round((e.clientX - f.left) / f.scale), y: Math.round((e.clientY - f.top) / f.scale)};
 }
 
 function send(message) {
@@ -96,9 +110,13 @@ function moveTo(point) {
 const BUTTONS = {0: 1, 1: 2, 2: 3, 3: 8, 4: 9};
 video.addEventListener('pointermove', e => { if (e.pointerType === 'mouse') moveTo(at(e)); });
 video.addEventListener('pointerdown', e => {
-  video.focus();
-  if (e.pointerType === 'mouse') send({t: 'button', b: BUTTONS[e.button] || 1, down: true, ...at(e)});
-  else touchStart(e);
+  if (e.pointerType !== 'mouse') {
+    if (document.activeElement !== field) video.focus();
+    return touchStart(e);
+  }
+  e.preventDefault();   // focus stays where typing goes: the field here while the browser has a field focused
+  (page.focus ? field : video).focus({preventScroll: true});
+  send({t: 'button', b: BUTTONS[e.button] || 1, down: true, ...at(e)});
 });
 video.addEventListener('pointerup', e => {
   if (e.pointerType === 'mouse') send({t: 'button', b: BUTTONS[e.button] || 1, down: false, ...at(e)});
@@ -112,21 +130,163 @@ video.addEventListener('wheel', e => {
 }, {passive: false});
 
 // Keys go to the screen while it has focus, including ones the page would otherwise act on.
-const typing = e => document.activeElement === video && !e.isComposing && e.key !== 'Process';
+const held = new Map();   // keys down on the screen, by code
+function key(e, down) {
+  e.preventDefault();
+  if (down) held.set(e.code, e.key);
+  else if (!held.delete(e.code)) return;
+  send({t: 'key', down, key: e.key, code: e.code});
+}
+function letGo() {
+  for (const [code, k] of held) send({t: 'key', down: false, key: k, code});
+  held.clear();
+}
 addEventListener('keydown', e => {
-  if (!typing(e)) return;
-  e.preventDefault();
-  send({t: 'key', down: true, key: e.key, code: e.code});
+  if (document.activeElement === video && !e.isComposing && e.key !== 'Process') key(e, true);
+  else if (document.activeElement === field) fieldKey(e);
 });
-addEventListener('keyup', e => {
-  if (!typing(e)) return;
-  e.preventDefault();
-  send({t: 'key', down: false, key: e.key, code: e.code});
+addEventListener('keyup', e => { if (held.has(e.code)) key(e, false); });
+addEventListener('blur', () => {
+  held.clear();
+  send({t: 'release'});
 });
-addEventListener('blur', () => send({t: 'release'}));
 
-// Touch: a tap clicks, a drag scrolls, a long press is a right click.
-let touch = null;
+// Typing into the browser's fields. While one has focus, the field on this page lies over it, so this device's own
+// keyboard and input method work as they would in the field itself. What changes here goes to the browser as text:
+// a composition as it is made, then the text it commits. Keys that do not make text still go as keys.
+const handheld = matchMedia('(pointer: coarse)').matches;   // its keyboard comes up only within a tap
+const apple = /Mac|iPhone|iPad/.test(navigator.platform);
+const EDITING = new Set(['Enter', 'Tab', 'Escape', 'Delete', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+                         'Home', 'End', 'PageUp', 'PageDown']);
+const MODES = {email: 'email', url: 'url', tel: 'tel', number: 'decimal', search: 'search'};
+const segmenter = Intl.Segmenter ? new Intl.Segmenter() : null;
+const characters = text => segmenter ? [...segmenter.segment(text)] : [...text].map((c, i) => ({index: i}));
+let page = {focus: null, fields: []};   // as the browser last reported it
+let typed = '';            // what of this field's text the browser's field holds, up to its caret
+let shown = '';            // the composition the browser's field shows
+let composition = null;    // the composition being made here, while there is one
+let typedAt = 0, openedAt = 0, later = null;
+
+function follow(state) {
+  const was = page.focus, focus = state.focus;
+  page = state;
+  clearTimeout(later);
+  if (!focus) {
+    // A tap that brought up the keyboard may not have reached the browser yet.
+    const wait = openedAt + 1000 - Date.now();
+    if (handheld && document.activeElement === field && wait > 0) return void (later = setTimeout(() => follow(page), wait));
+    return leave();
+  }
+  lay(focus.caret || focus.box);
+  const type = focus.kind === 'password' ? 'password' : 'text';
+  if (field.type !== type) field.type = type;
+  field.inputMode = focus.inputmode || MODES[focus.kind] || '';
+  field.enterKeyHint = focus.enterkeyhint || (focus.kind === 'search' ? 'search' : '');
+  if (focus.autocapitalize) field.setAttribute('autocapitalize', focus.autocapitalize);
+  else field.removeAttribute('autocapitalize');
+  // Start again from the browser's own text when it is another field, or when the field changed without typing
+  // from here; while typing goes on, the text here leads.
+  if (composition === null && (!was || was.id !== focus.id || field.value !== focus.before)) {
+    const idle = Date.now() - typedAt;
+    if (!was || was.id !== focus.id || idle > 700) start(focus.before);
+    else later = setTimeout(() => follow(page), 700 - idle);
+  }
+  if (!handheld && document.activeElement !== field) {
+    letGo();
+    field.focus({preventScroll: true});
+  }
+}
+
+function leave() {
+  if (document.activeElement === field) {
+    letGo();
+    field.blur();
+    if (!handheld) video.focus({preventScroll: true});
+  }
+  composition = null;
+  start('');
+}
+
+function start(text) {
+  field.value = typed = text;
+  shown = '';
+  field.setSelectionRange(text.length, text.length);
+}
+
+// Lay this page's field over the browser's, so that the keyboard and the input method's candidates show beside it.
+function lay(box) {
+  if (!box) return;   // inside a frame of another site, whose place is not known
+  const f = fit();
+  Object.assign(field.style, {left: f.left + box[0] * f.scale + 'px', top: f.top + box[1] * f.scale + 'px',
+                              width: Math.max(box[2] * f.scale, 1) + 'px', height: Math.max(box[3] * f.scale, 1) + 'px'});
+}
+
+// The last place at or before `at` that does not split a character.
+function whole(text, at) {
+  let start = 0;
+  for (const {index} of characters(text)) {
+    if (index > at) break;
+    start = index;
+  }
+  return at >= text.length ? at : start;
+}
+
+// Bring the browser's field to what this one holds: take back what changed, add what is new, show the composition.
+function sync() {
+  const value = field.value;
+  let committed = value, composing = '';
+  if (composition !== null) {
+    if (!value.endsWith(composition)) return;   // where the composition sits is not clear yet
+    committed = value.slice(0, value.length - composition.length);
+    composing = composition;
+  }
+  if (committed !== typed) {
+    let same = 0;
+    while (same < typed.length && same < committed.length && typed[same] === committed[same]) same++;
+    same = whole(typed, same);
+    const gone = typed.slice(same), added = committed.slice(same);
+    if (gone) {
+      if (shown) send({t: 'compose', text: shown = ''});
+      send({t: 'press', key: 'Backspace', count: characters(gone).length});
+    }
+    if (added) {
+      send({t: 'text', text: added});   // which also commits any composition the browser shows
+      shown = '';
+    }
+    typed = committed;
+    typedAt = Date.now();
+  }
+  if (composing !== shown) {
+    send({t: 'compose', text: shown = composing});
+    typedAt = Date.now();
+  }
+}
+
+field.addEventListener('compositionstart', () => { composition = ''; });
+field.addEventListener('compositionupdate', e => {
+  composition = e.data || '';
+  sync();
+});
+field.addEventListener('compositionend', () => {
+  composition = null;
+  sync();
+});
+field.addEventListener('input', sync);
+
+function fieldKey(e) {
+  if (e.isComposing || e.keyCode === 229) return;   // the input method's own
+  const command = e.ctrlKey || e.metaKey || (e.altKey && !apple && !e.getModifierState('AltGraph'));
+  if (command && e.code === 'KeyV') return;   // pasted here, this device's clipboard goes in as text
+  if (command || ['Control', 'Alt', 'Meta'].includes(e.key)) return key(e, true);
+  if (EDITING.has(e.key)) {
+    e.preventDefault();
+    sync();
+    send({t: 'press', key: e.key, shift: e.shiftKey});
+  }
+}
+
+// Touch: a tap clicks, a drag scrolls, a long press is a right click. A tap on a field brings up the keyboard.
+let touch = null, tapped = null;
 function touchStart(e) {
   if (touch) return;
   touch = {pointer: e.pointerId, x: e.clientX, y: e.clientY, at: at(e), time: Date.now(), dragging: false};
@@ -137,8 +297,7 @@ video.addEventListener('pointermove', e => {
   const dx = e.clientX - touch.x, dy = e.clientY - touch.y;
   if (!touch.dragging && Math.hypot(dx, dy) < 10) return;
   touch.dragging = true;
-  const r = video.getBoundingClientRect();
-  const scale = Math.min(r.width / (video.videoWidth || 1), r.height / (video.videoHeight || 1));
+  const scale = fit().scale;
   send({t: 'move', ...touch.at});
   send({t: 'wheel', dx: -dx / scale, dy: -dy / scale});
   touch.x = e.clientX;
@@ -150,10 +309,32 @@ function touchEnd(e) {
     const b = Date.now() - touch.time > 600 ? 3 : 1;
     send({t: 'button', b, down: true, ...touch.at});
     send({t: 'button', b, down: false, ...touch.at});
+    if (b === 1) tapped = touch.at;
   }
   touch = null;
 }
 video.addEventListener('pointercancel', () => { touch = null; });
+
+// The keyboard comes up only within the tap itself, too soon to ask the browser, so where the browser last said
+// its fields are decides it.
+const inside = (box, p) => !!box && p.x >= box[0] && p.y >= box[1] && p.x < box[0] + box[2] && p.y < box[1] + box[3];
+video.addEventListener('touchend', e => {
+  const point = tapped;
+  tapped = null;
+  if (!point) return;
+  const focus = page.focus, hidden = focus && !(focus.box && focus.box[2] >= 8 && focus.box[3] >= 8);
+  const box = inside(focus?.box, point) ? focus.box : page.fields.find(b => inside(b, point));
+  if (box || hidden) {   // some editors type through a field kept out of sight: then a tap anywhere will do
+    e.preventDefault();
+    if (document.activeElement === field) return;
+    if (box !== focus?.box) start('');
+    lay(box || focus.box);
+    field.focus();
+    openedAt = Date.now();
+  } else if (document.activeElement === field) {
+    field.blur();
+  }
+});
 
 // When the session ends, reload: the gate then says how to come back.
 setInterval(async () => {

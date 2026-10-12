@@ -8,18 +8,24 @@ It listens on loopback and trusts whoever reaches it; the gate decides who that 
   GET  /peers                           -> [{"id", "as", "session"}]
 
 Each connection has its own encoder, so each gets the rate its own link carries. Mouse and keys arrive on the
-connection's data channel and are played into the display as if from a real mouse and keyboard.
+connection's data channel and are played into the display as if from a real mouse and keyboard. Text typed into a
+page's field arrives there too and goes into the field as text, so a viewer's own keyboard and input method work;
+the same channel tells every viewer where the page's fields are.
 """
 import ctypes
 import json
 import os
+import queue
 import secrets
 import threading
 import time
+import urllib.request
 import weakref
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import gi
+from websockets.sync.client import connect
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstSdp", "1.0")
@@ -37,6 +43,8 @@ STUN = os.environ.get("SB_STUN", "")
 ICE_SERVERS = json.loads(os.environ.get("SB_ICE_SERVERS") or "[]")
 PORT = int(os.environ.get("SCREEN_PORT", "8081"))
 KBPS = int(os.environ.get("SCREEN_KBPS", "6000"))   # the most a connection may use
+CDP = os.environ.get("SCREEN_CDP", "http://127.0.0.1:9222")
+FIELDS = Path(__file__).with_name("fields.js").read_text()
 RTP = ("application/x-rtp,media=video,encoding-name=H264,payload=102,clock-rate=90000,packetization-mode=(string)1,"
        "rtcp-fb-nack-pli=true,rtcp-fb-nack=true,rtcp-fb-transport-cc=(boolean)true,"
        "extmap-1=(string)http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01")
@@ -152,12 +160,26 @@ class Input:
             elif kind == "button":
                 self.move(m)
                 self.button(int(m.get("b", 1)), bool(m.get("down")))
+                if m.get("down") and int(m.get("b", 1)) == 1 and "y" in m:
+                    BROWSER.clicked(int(m["y"]))
             elif kind == "wheel":
                 self.scroll(float(m.get("dx", 0)), float(m.get("dy", 0)))
             elif kind == "key":
                 self.key(bool(m.get("down")), str(m.get("key", "")), str(m.get("code", "")))
             elif kind == "release":
                 self.release()
+            elif kind == "text":   # into the focused field; typed on the keyboard when no page field has focus
+                text = str(m.get("text", ""))
+                if not BROWSER.insert(text):
+                    for char in text:
+                        self.tap({"\n": "Enter", "\t": "Tab"}.get(char, char))
+            elif kind == "compose":
+                BROWSER.compose(str(m.get("text", "")))
+            elif kind == "press":   # a key that edits rather than types, sent the same way as the text around it
+                key, count = str(m.get("key", "")), min(max(int(m.get("count", 1)), 0), 1000)
+                if not BROWSER.press(key, bool(m.get("shift")), count):
+                    for _ in range(count):
+                        self.tap(key)
             self.d.sync()
 
     def move(self, m):
@@ -191,6 +213,9 @@ class Input:
             return
         if code in self.pressed:   # held down: let go first, so a held key repeats
             xtest.fake_input(self.d, X.KeyRelease, self.pressed.pop(code))
+        if key == "F6" or (key.lower() in ("l", "k", "e") and self.holding("Control")) \
+                or (key.lower() == "d" and self.holding("Alt")):
+            BROWSER.to_bar()
         if key in self.NAMED:
             keycode = self.d.keysym_to_keycode(XK.string_to_keysym(self.NAMED[key]))
             if keycode:
@@ -217,6 +242,13 @@ class Input:
             xtest.fake_input(self.d, X.KeyPress, self.spare)
             xtest.fake_input(self.d, X.KeyRelease, self.spare)
 
+    def tap(self, key):
+        self.key(True, key, "tap")
+        self.key(False, key, "tap")
+
+    def holding(self, name):
+        return f"{name}Left" in self.pressed or f"{name}Right" in self.pressed
+
     def shift_keys(self):
         return {self.d.keysym_to_keycode(XK.string_to_keysym(n)) for n in ("Shift_L", "Shift_R")}
 
@@ -230,7 +262,239 @@ class Input:
         self.shift = False
 
 
-INPUT = None
+class Browser:
+    """The browser over CDP: where its fields are, for the viewers, and the text they type into them.
+
+    A script in each frame (fields.js) reports which field has focus, the text before its caret, and where fields are
+    on the display, and every viewer is told. The script runs in a world of its own, which the page cannot see, and
+    is reached without the Runtime domain, whose events would let a page tell that it is being watched.
+
+    Pages cannot say for sure whether they are in front: another CDP client, such as an agent's, may make every page
+    think it is shown and focused. So the page in front is the one Chrome lists first, as its tab shown last, and
+    whether typing goes to the browser's own bar instead is told from where people click and the keys they press.
+    """
+    WORLD = "shared-browser"
+    KEYS = {"Backspace": 8, "Tab": 9, "Enter": 13, "Escape": 27, "PageUp": 33, "PageDown": 34, "End": 35,
+            "Home": 36, "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40, "Delete": 46}
+
+    def __init__(self):
+        self.ws = None
+        self.lock = threading.Lock()
+        self.replies, self.count = {}, 0
+        self.jobs = queue.Queue()
+        self.sessions = {}         # tab -> our session with it
+        self.frames = {}           # (session, context) -> what the frame last reported
+        self.listening = set()     # (session, context) waiting for the frame's next report
+        self.front = None          # the tab in front
+        self.bar = False           # whether typing goes to the browser's own bar, as after a click on it
+        self.target = None         # the session of the page whose field has focus
+        self.state = json.dumps({"t": "page", "focus": None, "fields": []})
+        threading.Thread(target=self.run, daemon=True).start()
+        threading.Thread(target=self.work, daemon=True).start()
+        threading.Thread(target=self.follow_front, daemon=True).start()
+
+    def follow_front(self):
+        while True:
+            try:
+                with urllib.request.urlopen(CDP + "/json/list", timeout=2) as reply:
+                    front = next((t["id"] for t in json.load(reply) if t.get("type") == "page"), None)
+            except Exception:
+                front = None
+            if front != self.front:
+                self.front, self.bar = front, False
+                self.update()
+            time.sleep(0.3)
+
+    def clicked(self, y):
+        """A click above the page lands on the browser's own bar, and typing then goes there; one on the page, back."""
+        top = self.top() or {}
+        bar = bool(top.get("viewport")) and y < top["viewport"][1]
+        if bar != self.bar:
+            self.bar = bar
+            self.update()
+
+    def to_bar(self):
+        """Keys that move typing to the browser's own bar, such as Ctrl+L, were pressed."""
+        if not self.bar:
+            self.bar = True
+            self.update()
+
+    def top(self):
+        with self.lock:
+            session = self.sessions.get(self.front)
+            return next((report for (s, _), report in self.frames.items() if s == session and report.get("top")), None)
+
+    def run(self):
+        while True:
+            try:
+                with urllib.request.urlopen(CDP + "/json/version", timeout=2) as reply:
+                    url = json.load(reply)["webSocketDebuggerUrl"]
+                with connect(url, max_size=None, open_timeout=5) as ws:
+                    self.ws = ws
+                    self.jobs.put((self.call, ("Target.setAutoAttach",), {
+                        "autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True,
+                        "filter": [{"type": "page"}]}))
+                    for raw in ws:
+                        self.receive(json.loads(raw))
+            except Exception:
+                pass
+            with self.lock:
+                self.ws = None
+                self.replies.clear()
+                self.sessions.clear()
+                self.frames.clear()
+                self.listening.clear()
+            self.update()
+            time.sleep(1)
+
+    def work(self):
+        while True:
+            job, args, kwargs = self.jobs.get()
+            try:
+                job(*args, **kwargs)
+            except Exception:
+                pass
+
+    def call(self, method, session=None, then=None, **params):
+        """Send a command and wait for its result, None if it failed. With then, return at once and hand it the
+        result when it comes."""
+        done, result = threading.Event(), []
+        with self.lock:
+            if self.ws is None:
+                return None
+            self.count += 1
+            self.replies[self.count] = then or (lambda value: (result.append(value), done.set()))
+            message = {"id": self.count, "method": method, "params": params}
+            if session:
+                message["sessionId"] = session
+            try:
+                self.ws.send(json.dumps(message))
+            except Exception:
+                return None
+        if then is None:
+            done.wait(3)
+            return result[0] if result else None
+
+    def receive(self, message):
+        if "id" in message:
+            with self.lock:
+                reply = self.replies.pop(message["id"], None)
+            if reply:
+                reply(message.get("result"))
+            return
+        method, params, session = message.get("method"), message.get("params", {}), message.get("sessionId")
+        if method == "Target.attachedToTarget":
+            with self.lock:
+                self.sessions[params["targetInfo"]["targetId"]] = params["sessionId"]
+            self.jobs.put((self.watch, (params["sessionId"],), {}))
+        elif method in ("Page.frameNavigated", "Page.frameStoppedLoading"):
+            frame = params["frame"]["id"] if "frame" in params else params["frameId"]
+            if method == "Page.frameNavigated" and "parentId" not in params["frame"] and self.bar \
+                    and session == self.sessions.get(self.front):
+                self.bar = False   # the page in front went somewhere, as after typing an address: typing is back on it
+            self.jobs.put((self.install, (session, frame), {}))
+        elif method == "Target.detachedFromTarget":
+            with self.lock:
+                for tab in [tab for tab, s in self.sessions.items() if s == params["sessionId"]]:
+                    del self.sessions[tab]
+                for key in [key for key in self.frames if key[0] == params["sessionId"]]:
+                    del self.frames[key]
+            self.update()
+
+    def watch(self, session):
+        """Look into every frame of a page, now and as its frames load."""
+        if self.call("Page.enable", session) is None:
+            return
+        tree = self.call("Page.getFrameTree", session)
+        nodes = [tree["frameTree"]] if tree else []
+        while nodes:
+            node = nodes.pop()
+            self.install(session, node["frame"]["id"])
+            nodes.extend(node.get("childFrames", []))
+
+    def install(self, session, frame):
+        world = self.call("Page.createIsolatedWorld", session, frameId=frame, worldName=self.WORLD)
+        if world and self.call("Runtime.evaluate", session, expression=FIELDS, contextId=world["executionContextId"]):
+            key = (session, world["executionContextId"])
+            with self.lock:
+                if key in self.listening:
+                    return
+                self.listening.add(key)
+            self.listen(key, first=True)
+
+    def listen(self, key, first=False):
+        """Wait for the frame's next report, or at first ask for how it is now: the script may have run before, for
+        an earlier connection. Its world goes with its document, and then the wait ends with an error."""
+        def heard(result):
+            value = ((result or {}).get("result") or {}).get("value")
+            report = json.loads(value) if isinstance(value, str) else {"gone": True}
+            with self.lock:
+                if report.get("gone"):
+                    self.frames.pop(key, None)
+                    self.listening.discard(key)
+                else:
+                    self.frames[key] = report
+            self.update()
+            if not report.get("gone"):
+                self.listen(key)
+        self.call("Runtime.evaluate", key[0], then=heard, expression=f"__sbNext({'true' if first else ''})",
+                  contextId=key[1], awaitPromise=True, returnByValue=True)
+
+    def update(self):
+        """Work out the focused field and the fields of the page in front, and tell the viewers when that changes."""
+        with self.lock:
+            session = self.sessions.get(self.front)
+            frames = [(context, report) for (s, context), report in self.frames.items() if s == session]
+        top = next(((context, report) for context, report in frames if report.get("top")), None)
+        if top is None or self.bar or not top[1].get("focused"):
+            chosen = None
+        elif top[1].get("focus"):
+            chosen = top
+        elif top[1].get("inFrame"):   # focus went on into a frame: the one where it moved last
+            inner = [(context, report) for context, report in frames if report.get("focus") and not report.get("top")]
+            chosen = max(inner, key=lambda frame: frame[1].get("moved", 0), default=None)
+        else:
+            chosen = None
+        focus = chosen and dict(chosen[1]["focus"], id=f"{session}/{chosen[0]}/{chosen[1]['focus']['id']}")
+        fields = [box for _, report in frames for box in report.get("fields") or []]
+        self.target = session if focus else None
+        state = json.dumps({"t": "page", "focus": focus, "fields": fields})
+        with self.lock:
+            if state == self.state:
+                return
+            self.state = state
+        with PEERS_LOCK:
+            peers = list(PEERS.values())
+        for peer in peers:
+            peer.tell(state)
+
+    # Typing, into the field with focus. Each returns False when no page field has focus to take it.
+
+    def insert(self, text):
+        return self.target is not None and self.call("Input.insertText", self.target, text=text) is not None
+
+    def compose(self, text):
+        end = len(text.encode("utf-16-le")) // 2
+        return self.target is not None and self.call("Input.imeSetComposition", self.target, text=text,
+                                                     selectionStart=end, selectionEnd=end) is not None
+
+    def press(self, key, shift, count):
+        code = self.KEYS.get(key)
+        if self.target is None or code is None:
+            return False
+        down = {"type": "rawKeyDown", "key": key, "code": key, "windowsVirtualKeyCode": code,
+                "nativeVirtualKeyCode": code, "modifiers": 8 if shift else 0}
+        if key == "Enter":
+            down.update(type="keyDown", text="\r", unmodifiedText="\r")
+        up = {name: value for name, value in down.items() if name not in ("text", "unmodifiedText")} | {"type": "keyUp"}
+        for _ in range(count):
+            if self.call("Input.dispatchKeyEvent", self.target, **down) is None:
+                return False
+            self.call("Input.dispatchKeyEvent", self.target, **up)
+        return True
+
+
+INPUT = BROWSER = None
 
 
 def turn_url(server, url):
@@ -295,6 +559,7 @@ class Peer:
         transceiver.set_property("codec-preferences", Gst.Caps.from_string(RTP))
         transceiver.set_property("do-nack", True)
         self.channel = self.webrtc.emit("create-data-channel", "input", None)
+        self.channel.connect("on-open", lambda channel: channel.emit("send-string", BROWSER.state))
         self.channel.connect("on-message-string", lambda _channel, text: INPUT.handle(text))
         self.channel.connect("on-close", lambda _channel: INPUT.handle('{"t": "release"}'))
         promise = Gst.Promise.new()
@@ -331,6 +596,10 @@ class Peer:
         if self.webrtc.get_property("connection-state") != GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
             threading.Thread(target=self.close, daemon=True).start()
         return False
+
+    def tell(self, text):
+        if not self.closed and self.channel.get_property("ready-state") == GstWebRTC.WebRTCDataChannelState.OPEN:
+            self.channel.emit("send-string", text)
 
     def close(self):
         with PEERS_LOCK:
@@ -390,5 +659,6 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     INPUT = Input()
+    BROWSER = Browser()
     threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
