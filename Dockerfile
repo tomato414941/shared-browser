@@ -11,7 +11,7 @@ ARG CHROME_DEB=https://dl.google.com/linux/direct/google-chrome-stable_current_a
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates wget supervisor xvfb x11-utils openbox socat \
-        python3 python3-gi python3-xlib python3-websockets \
+        python3 python3-gi python3-xlib python3-websockets ibus ibus-gtk3 ibus-gtk4 gir1.2-ibus-1.0 \
         gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 gir1.2-gst-plugins-bad-1.0 \
         gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
         gstreamer1.0-nice gstreamer1.0-x fonts-noto-cjk fonts-noto-color-emoji; \

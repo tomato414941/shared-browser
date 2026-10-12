@@ -8,9 +8,10 @@ It listens on loopback and trusts whoever reaches it; the gate decides who that 
   GET  /peers                           -> [{"id", "as", "session"}]
 
 Each connection has its own encoder, so each gets the rate its own link carries. Mouse and keys arrive on the
-connection's data channel and are played into the display as if from a real mouse and keyboard. Text typed into a
-page's field arrives there too and goes into the field as text, so a viewer's own keyboard and input method work;
-the same channel tells every viewer where the page's fields are.
+connection's data channel and are played into the display as if from a real mouse and keyboard. Text arrives there
+too, made on the viewer's device by its own keyboard or input method, and goes in through an input method of the
+screen's own, wherever a field has focus: a page, the address bar, a dialog. The same channel tells every viewer when
+a field has focus, and where the page's fields are.
 """
 import ctypes
 import json
@@ -30,7 +31,8 @@ from websockets.sync.client import connect
 gi.require_version("Gst", "1.0")
 gi.require_version("GstSdp", "1.0")
 gi.require_version("GstWebRTC", "1.0")
-from gi.repository import GLib, Gst, GstSdp, GstWebRTC  # noqa: E402
+gi.require_version("IBus", "1.0")
+from gi.repository import GLib, GObject, Gst, GstSdp, GstWebRTC, IBus  # noqa: E402
 from Xlib import X, XK, display  # noqa: E402
 from Xlib.ext import xtest  # noqa: E402
 
@@ -128,6 +130,7 @@ class Input:
              "Control": "Control_L", "Alt": "Alt_L", "Meta": "Super_L", "CapsLock": "Caps_Lock",
              "ContextMenu": "Menu", " ": "space", **{f"F{i}": f"F{i}" for i in range(1, 13)}}
     STEP = 120   # pixels Chrome scrolls for one wheel click
+    SETTLE = 0.03   # seconds for text or keys to land; 10 ms was enough in testing
 
     def __init__(self):
         while True:
@@ -147,6 +150,7 @@ class Input:
         self.buttons = set()
         self.wheel = [0.0, 0.0]
         self.shift = False
+        self.way, self.sent = "keys", 0.0   # how the last input went in, and when
 
     def handle(self, message):
         try:
@@ -155,32 +159,41 @@ class Input:
             return
         with self.lock:
             kind = m.get("t")
+            if kind in ("text", "compose"):
+                self.turn("text")
+            elif kind in ("button", "wheel", "key", "press"):
+                self.turn("keys")
             if kind == "move":
                 self.move(m)
             elif kind == "button":
                 self.move(m)
                 self.button(int(m.get("b", 1)), bool(m.get("down")))
-                if m.get("down") and int(m.get("b", 1)) == 1 and "y" in m:
-                    BROWSER.clicked(int(m["y"]))
             elif kind == "wheel":
                 self.scroll(float(m.get("dx", 0)), float(m.get("dy", 0)))
             elif kind == "key":
                 self.key(bool(m.get("down")), str(m.get("key", "")), str(m.get("code", "")))
             elif kind == "release":
                 self.release()
-            elif kind == "text":   # into the focused field; typed on the keyboard when no page field has focus
+            elif kind == "text":   # into the field with focus; key by key into a password, which takes no input method
                 text = str(m.get("text", ""))
-                if not BROWSER.insert(text):
+                if BROWSER.secret() or not TYPING.commit(text):
                     for char in text:
                         self.tap({"\n": "Enter", "\t": "Tab"}.get(char, char))
             elif kind == "compose":
-                BROWSER.compose(str(m.get("text", "")))
-            elif kind == "press":   # a key that edits rather than types, sent the same way as the text around it
-                key, count = str(m.get("key", "")), min(max(int(m.get("count", 1)), 0), 1000)
-                if not BROWSER.press(key, bool(m.get("shift")), count):
-                    for _ in range(count):
-                        self.tap(key)
+                if not BROWSER.secret():
+                    TYPING.compose(str(m.get("text", "")))
+            elif kind == "press":   # a key that edits the text around it: Backspace, Enter, the arrows
+                for _ in range(min(max(int(m.get("count", 1)), 0), 1000)):
+                    self.tap(str(m.get("key", "")), bool(m.get("shift")))
             self.d.sync()
+            self.sent = time.monotonic()
+
+    def turn(self, way):
+        """Text goes in through the input method and keys through X, and Chrome takes the two in its own order: when
+        the way changes, let what went the other way land first."""
+        if way != self.way:
+            time.sleep(max(0.0, self.sent + self.SETTLE - time.monotonic()))
+            self.way = way
 
     def move(self, m):
         if "x" in m and "y" in m:
@@ -213,9 +226,6 @@ class Input:
             return
         if code in self.pressed:   # held down: let go first, so a held key repeats
             xtest.fake_input(self.d, X.KeyRelease, self.pressed.pop(code))
-        if key == "F6" or (key.lower() in ("l", "k", "e") and self.holding("Control")) \
-                or (key.lower() == "d" and self.holding("Alt")):
-            BROWSER.to_bar()
         if key in self.NAMED:
             keycode = self.d.keysym_to_keycode(XK.string_to_keysym(self.NAMED[key]))
             if keycode:
@@ -242,12 +252,13 @@ class Input:
             xtest.fake_input(self.d, X.KeyPress, self.spare)
             xtest.fake_input(self.d, X.KeyRelease, self.spare)
 
-    def tap(self, key):
+    def tap(self, key, shift=False):
+        if shift:
+            self.key(True, "Shift", "tap-shift")
         self.key(True, key, "tap")
         self.key(False, key, "tap")
-
-    def holding(self, name):
-        return f"{name}Left" in self.pressed or f"{name}Right" in self.pressed
+        if shift:
+            self.key(False, "Shift", "tap-shift")
 
     def shift_keys(self):
         return {self.d.keysym_to_keycode(XK.string_to_keysym(n)) for n in ("Shift_L", "Shift_R")}
@@ -263,19 +274,16 @@ class Input:
 
 
 class Browser:
-    """The browser over CDP: where its fields are, for the viewers, and the text they type into them.
+    """What the viewers are told about typing: whether a field has focus and where, and where the page's fields are.
 
-    A script in each frame (fields.js) reports which field has focus, the text before its caret, and where fields are
-    on the display, and every viewer is told. The script runs in a world of its own, which the page cannot see, and
-    is reached without the Runtime domain, whose events would let a page tell that it is being watched.
-
-    Pages cannot say for sure whether they are in front: another CDP client, such as an agent's, may make every page
-    think it is shown and focused. So the page in front is the one Chrome lists first, as its tab shown last, and
-    whether typing goes to the browser's own bar instead is told from where people click and the keys they press.
+    A script in each frame (fields.js) tells the page's part: where its fields are, so a phone can bring up its
+    keyboard within a tap on one, and of the field with focus, its kind and the text before its caret. It runs in a
+    world of its own, which the page cannot see, and is reached without the Runtime domain, whose events would let a
+    page tell it is watched. Chrome's own fields, such as the address bar, are the input method's to tell (Typing).
+    Another CDP client, such as an agent's, may make every page think it is shown, so the page in front is the one
+    Chrome lists first, as its tab shown last.
     """
     WORLD = "shared-browser"
-    KEYS = {"Backspace": 8, "Tab": 9, "Enter": 13, "Escape": 27, "PageUp": 33, "PageDown": 34, "End": 35,
-            "Home": 36, "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40, "Delete": 46}
 
     def __init__(self):
         self.ws = None
@@ -283,11 +291,11 @@ class Browser:
         self.replies, self.count = {}, 0
         self.jobs = queue.Queue()
         self.sessions = {}         # tab -> our session with it
+        self.pages = {}            # session with a frame of another site -> the session of its page
         self.frames = {}           # (session, context) -> what the frame last reported
+        self.focus = None          # the field with focus, as the viewers were last told
         self.listening = set()     # (session, context) waiting for the frame's next report
         self.front = None          # the tab in front
-        self.bar = False           # whether typing goes to the browser's own bar, as after a click on it
-        self.target = None         # the session of the page whose field has focus
         self.state = json.dumps({"t": "page", "focus": None, "fields": []})
         threading.Thread(target=self.run, daemon=True).start()
         threading.Thread(target=self.work, daemon=True).start()
@@ -301,28 +309,9 @@ class Browser:
             except Exception:
                 front = None
             if front != self.front:
-                self.front, self.bar = front, False
+                self.front = front
                 self.update()
             time.sleep(0.3)
-
-    def clicked(self, y):
-        """A click above the page lands on the browser's own bar, and typing then goes there; one on the page, back."""
-        top = self.top() or {}
-        bar = bool(top.get("viewport")) and y < top["viewport"][1]
-        if bar != self.bar:
-            self.bar = bar
-            self.update()
-
-    def to_bar(self):
-        """Keys that move typing to the browser's own bar, such as Ctrl+L, were pressed."""
-        if not self.bar:
-            self.bar = True
-            self.update()
-
-    def top(self):
-        with self.lock:
-            session = self.sessions.get(self.front)
-            return next((report for (s, _), report in self.frames.items() if s == session and report.get("top")), None)
 
     def run(self):
         while True:
@@ -342,6 +331,7 @@ class Browser:
                 self.ws = None
                 self.replies.clear()
                 self.sessions.clear()
+                self.pages.clear()
                 self.frames.clear()
                 self.listening.clear()
             self.update()
@@ -385,26 +375,29 @@ class Browser:
         method, params, session = message.get("method"), message.get("params", {}), message.get("sessionId")
         if method == "Target.attachedToTarget":
             with self.lock:
-                self.sessions[params["targetInfo"]["targetId"]] = params["sessionId"]
+                if session:   # a frame of another site, in a process of its own: it counts as its page's
+                    self.pages[params["sessionId"]] = self.pages.get(session, session)
+                else:
+                    self.sessions[params["targetInfo"]["targetId"]] = params["sessionId"]
             self.jobs.put((self.watch, (params["sessionId"],), {}))
         elif method in ("Page.frameNavigated", "Page.frameStoppedLoading"):
             frame = params["frame"]["id"] if "frame" in params else params["frameId"]
-            if method == "Page.frameNavigated" and "parentId" not in params["frame"] and self.bar \
-                    and session == self.sessions.get(self.front):
-                self.bar = False   # the page in front went somewhere, as after typing an address: typing is back on it
             self.jobs.put((self.install, (session, frame), {}))
         elif method == "Target.detachedFromTarget":
             with self.lock:
                 for tab in [tab for tab, s in self.sessions.items() if s == params["sessionId"]]:
                     del self.sessions[tab]
+                self.pages.pop(params["sessionId"], None)
                 for key in [key for key in self.frames if key[0] == params["sessionId"]]:
                     del self.frames[key]
             self.update()
 
     def watch(self, session):
-        """Look into every frame of a page, now and as its frames load."""
+        """Look into every frame of a page, now and as its frames load, those of other sites included."""
         if self.call("Page.enable", session) is None:
             return
+        self.call("Target.setAutoAttach", session, autoAttach=True, waitForDebuggerOnStart=False, flatten=True,
+                  filter=[{"type": "iframe"}])
         tree = self.call("Page.getFrameTree", session)
         nodes = [tree["frameTree"]] if tree else []
         while nodes:
@@ -441,23 +434,25 @@ class Browser:
                   contextId=key[1], awaitPromise=True, returnByValue=True)
 
     def update(self):
-        """Work out the focused field and the fields of the page in front, and tell the viewers when that changes."""
+        """Put together what the viewers are told, and tell them when it changes.
+
+        A field has focus in the page if the frame where focus last moved says so. Chrome's own fields, such as the
+        address bar, are not the page's: for those the input method knows where the caret is.
+        """
         with self.lock:
             session = self.sessions.get(self.front)
-            frames = [(context, report) for (s, context), report in self.frames.items() if s == session]
-        top = next(((context, report) for context, report in frames if report.get("top")), None)
-        if top is None or self.bar or not top[1].get("focused"):
-            chosen = None
-        elif top[1].get("focus"):
-            chosen = top
-        elif top[1].get("inFrame"):   # focus went on into a frame: the one where it moved last
-            inner = [(context, report) for context, report in frames if report.get("focus") and not report.get("top")]
-            chosen = max(inner, key=lambda frame: frame[1].get("moved", 0), default=None)
+            frames = [(key, report) for key, report in self.frames.items() if self.pages.get(key[0], key[0]) == session]
+        (where, context), last = max(frames, key=lambda frame: frame[1].get("moved", 0), default=((None, None), {}))
+        caret = TYPING.caret
+        if last.get("focus"):
+            focus = dict(last["focus"], id=f"{where}/{context}/{last['focus']['id']}")
+        elif caret:
+            focus = {"id": "browser", "kind": "text", "before": "", "caret": caret,
+                     "box": [caret[0] - 300, caret[1] - 8, caret[2] + 600, caret[3] + 16]}
         else:
-            chosen = None
-        focus = chosen and dict(chosen[1]["focus"], id=f"{session}/{chosen[0]}/{chosen[1]['focus']['id']}")
+            focus = None
+        self.focus = focus
         fields = [box for _, report in frames for box in report.get("fields") or []]
-        self.target = session if focus else None
         state = json.dumps({"t": "page", "focus": focus, "fields": fields})
         with self.lock:
             if state == self.state:
@@ -468,33 +463,110 @@ class Browser:
         for peer in peers:
             peer.tell(state)
 
-    # Typing, into the field with focus. Each returns False when no page field has focus to take it.
+    def secret(self):
+        return (self.focus or {}).get("kind") == "password"
 
-    def insert(self, text):
-        return self.target is not None and self.call("Input.insertText", self.target, text=text) is not None
+
+class Typing:
+    """An input method of the screen's own, which converts nothing: text comes made, from the viewer's device.
+
+    It puts text in wherever typing goes, the way input methods do, a composition as it is made and then the text
+    committed: a page's field, Chrome's address bar, its dialogs, other programs. So typing works the same
+    everywhere, in any language. Chrome tells it where the caret is in its own fields, not in pages.
+    """
+    NAME = "shared-browser"
+
+    def __init__(self):
+        self.engine = None   # Chrome's input context, as the framework hands it to this input method
+        self.caret = None    # where the caret is in a field of Chrome's own, while one has it: [x, y, width, height]
+        self.settling = False
+        IBus.init()
+        GLib.idle_add(self.connect)
+
+    def connect(self):
+        bus = IBus.Bus.new()
+        if not bus.is_connected():   # the framework may not be up yet, or may have been started again
+            GLib.timeout_add_seconds(1, self.connect)
+            return False
+        bus.connect("disconnected", lambda _bus: GLib.timeout_add_seconds(1, self.connect))
+        self.factory = IBus.Factory.new(bus.get_connection())
+        self.factory.add_engine(self.NAME, GObject.type_from_name("ScreenField"))
+        component = IBus.Component.new(f"org.sharedbrowser.{self.NAME}", "Text typed by viewers", "1", "", "", "", "",
+                                       self.NAME)
+        component.add_engine(IBus.EngineDesc.new(self.NAME, "Shared browser", "Text typed by viewers", "", "", "", "",
+                                                 "us"))
+        bus.register_component(component)
+        bus.set_global_engine_async(self.NAME, -1, None, None, None)
+        self.bus = bus
+        return False
+
+    def focused(self, engine):
+        self.engine = engine
+
+    def moved(self, engine, caret):
+        """Where the caret is: in a field of Chrome's own, or nowhere Chrome tells, as in a page (all zero)."""
+        caret = caret if any(caret) else None
+        if engine is self.engine and caret != self.caret:
+            self.caret = caret
+            self.changed()
+
+    def changed(self):
+        """Tell the viewers once things settle: Chrome tells it over again as focus moves."""
+        if not self.settling:
+            self.settling = True
+            GLib.timeout_add(40, self.settle)
+
+    def settle(self):
+        self.settling = False
+        BROWSER.update()
+        return False
+
+    def commit(self, text):
+        def put(engine):
+            engine.update_preedit_text(IBus.Text.new_from_string(""), 0, False)
+            engine.commit_text(IBus.Text.new_from_string(text))
+        return self.on_main(put)
 
     def compose(self, text):
-        end = len(text.encode("utf-16-le")) // 2
-        return self.target is not None and self.call("Input.imeSetComposition", self.target, text=text,
-                                                     selectionStart=end, selectionEnd=end) is not None
+        def show(engine):
+            preedit = IBus.Text.new_from_string(text)
+            preedit.append_attribute(IBus.AttrType.UNDERLINE, IBus.AttrUnderline.SINGLE, 0, len(text))
+            engine.update_preedit_text(preedit, len(text), bool(text))
+        return self.on_main(show)
 
-    def press(self, key, shift, count):
-        code = self.KEYS.get(key)
-        if self.target is None or code is None:
+    def on_main(self, act):
+        """Act on the main loop, where the input method lives, and wait, so what comes next comes after. False when
+        Chrome has not handed the input method a context yet."""
+        engine = self.engine
+        if engine is None:
             return False
-        down = {"type": "rawKeyDown", "key": key, "code": key, "windowsVirtualKeyCode": code,
-                "nativeVirtualKeyCode": code, "modifiers": 8 if shift else 0}
-        if key == "Enter":
-            down.update(type="keyDown", text="\r", unmodifiedText="\r")
-        up = {name: value for name, value in down.items() if name not in ("text", "unmodifiedText")} | {"type": "keyUp"}
-        for _ in range(count):
-            if self.call("Input.dispatchKeyEvent", self.target, **down) is None:
-                return False
-            self.call("Input.dispatchKeyEvent", self.target, **up)
-        return True
+        done = threading.Event()
+
+        def go():
+            try:
+                act(engine)
+            finally:
+                done.set()
+            return False
+        GLib.idle_add(go)
+        return done.wait(1)
 
 
-INPUT = BROWSER = None
+class ScreenField(IBus.Engine):
+    """A program's input context, as the screen's input method sees it."""
+    __gtype_name__ = "ScreenField"
+
+    def do_focus_in(self):
+        TYPING.focused(self)
+
+    def do_set_cursor_location(self, x, y, width, height):
+        TYPING.moved(self, [x, y, width, height])
+
+    def do_process_key_event(self, keyval, keycode, state):
+        return False   # keys pass as they come
+
+
+INPUT = BROWSER = TYPING = None
 
 
 def turn_url(server, url):
@@ -659,6 +731,7 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     INPUT = Input()
+    TYPING = Typing()
     BROWSER = Browser()
     threading.Thread(target=GLib.MainLoop().run, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()

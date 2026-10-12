@@ -1,7 +1,7 @@
-// Runs in each frame, in a world of its own that the page cannot see. Tells the screen which field has focus, the
-// text before its caret, and where fields are on the display, so that a viewer can bring up its own keyboard and
-// input method over them. The screen asks with __sbNext(), which answers once something has changed, and with
-// __sbNext(true) when it starts listening, which answers at once.
+// Runs in each frame, in a world of its own that the page cannot see. Tells the screen where the page's fields are
+// on the display, so a phone can bring up its keyboard within a tap on one, and of the field with focus, its kind
+// and the text before its caret, so the viewer's keyboard can fit it. The screen asks with __sbNext(), which answers
+// once something has changed, and with __sbNext(true) when it starts listening, which answers at once.
 (() => {
   if (globalThis.__sbNext) return;
   const TEXT = new Set(['text', 'search', 'email', 'url', 'tel', 'password', 'number']);
@@ -99,10 +99,7 @@
     return found;
   }
 
-  // What the screen needs of this frame. Another CDP client may make every page think it is shown and focused, so
-  // the screen does not take that alone: it also gets where focus last moved (moved), whether it went on into a
-  // frame (inFrame), and where the page sits on the display (viewport), to tell a click on the page from one on the
-  // browser's own bar.
+  // What the screen needs of this frame: its field with focus, when focus last moved here, and its fields.
   function state() {
     const p = place(), el = active(), focused = document.hasFocus(), visible = document.visibilityState === 'visible';
     let focus = null;
@@ -114,9 +111,7 @@
                autocapitalize: el.getAttribute('autocapitalize') || '', before: before(el)};
     }
     if (fields === null) fields = p && visible ? visibleFields(p) : [];
-    return {top: window === window.top, focused, focus, fields, moved,
-            inFrame: !!el && (el.localName === 'iframe' || el.localName === 'frame'),
-            viewport: p && box({left: 0, top: 0, width: innerWidth, height: innerHeight}, p)};
+    return {focus, fields, moved};
   }
 
   function tell() {
@@ -136,11 +131,12 @@
   }
 
   for (const type of ['selectionchange', 'input']) document.addEventListener(type, () => soon(20, false), true);
-  document.addEventListener('focusin', () => {
-    moved = Date.now();
-    soon(20);
-  }, true);
-  document.addEventListener('focusout', () => soon(20), true);
+  for (const type of ['focusin', 'focusout']) {
+    document.addEventListener(type, () => {
+      moved = Date.now();
+      soon(20);
+    }, true);
+  }
   addEventListener('focus', () => soon(0));
   addEventListener('blur', () => soon(0));
   addEventListener('scroll', () => soon(120), true);

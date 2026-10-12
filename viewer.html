@@ -278,7 +278,8 @@ function fieldKey(e) {
   const command = e.ctrlKey || e.metaKey || (e.altKey && !apple && !e.getModifierState('AltGraph'));
   if (command && e.code === 'KeyV') return;   // pasted here, this device's clipboard goes in as text
   if (command || ['Control', 'Alt', 'Meta'].includes(e.key)) return key(e, true);
-  if (EDITING.has(e.key)) {
+  const atStart = field.selectionStart === 0 && field.selectionEnd === 0;   // nothing here to take back
+  if (EDITING.has(e.key) || (e.key === 'Backspace' && atStart)) {
     e.preventDefault();
     sync();
     send({t: 'press', key: e.key, shift: e.shiftKey});
@@ -323,7 +324,7 @@ video.addEventListener('touchend', e => {
   tapped = null;
   if (!point) return;
   const focus = page.focus, hidden = focus && !(focus.box && focus.box[2] >= 8 && focus.box[3] >= 8);
-  const box = inside(focus?.box, point) ? focus.box : page.fields.find(b => inside(b, point));
+  const box = [focus?.box, ...page.fields].find(b => inside(b, point));
   if (box || hidden) {   // some editors type through a field kept out of sight: then a tap anywhere will do
     e.preventDefault();
     if (document.activeElement === field) return;
