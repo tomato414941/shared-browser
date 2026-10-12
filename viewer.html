@@ -22,8 +22,9 @@ const video = document.getElementById('screen');
 const status = document.getElementById('status');
 let pc = null, channel = null, id = null, retry = null;
 
-const post = (path, body) => fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'},
-                                          body: JSON.stringify(body)});
+const post = (path, body, keepalive = false) => fetch(path, {method: 'POST', keepalive,
+                                                             headers: {'Content-Type': 'application/json'},
+                                                             body: JSON.stringify(body)});
 
 async function connect() {
   clearTimeout(retry);
@@ -68,8 +69,10 @@ function again(ms) {
 }
 
 video.addEventListener('playing', () => { status.hidden = true; });
+// Hang up as the page goes, so its place frees at once. A fetch, not a beacon: this page sends no referrer, and a
+// beacon then goes without the origin the gate checks.
 addEventListener('pagehide', () => {
-  if (id) navigator.sendBeacon('screen/close', JSON.stringify({id}));
+  if (id) post('screen/close', {id}, true);
 });
 
 // Where a point on the page falls on the screen, which is shown whole and centered.
